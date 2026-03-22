@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+VENV="$SCRIPT_DIR/.venv/bin/python"
+
 # Colors
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -15,22 +17,29 @@ log() { echo -e "${GREEN}[sentinel]${NC} $1"; }
 warn() { echo -e "${YELLOW}[sentinel]${NC} $1"; }
 error() { echo -e "${RED}[sentinel]${NC} $1"; }
 
+_ensure_venv() {
+  if [ ! -f "$SCRIPT_DIR/.venv/bin/python" ]; then
+    log "Setting up Python virtual environment..."
+    python3 -m venv "$SCRIPT_DIR/.venv"
+  fi
+  "$SCRIPT_DIR/.venv/bin/pip" install --upgrade pip -q 2>/dev/null
+  "$SCRIPT_DIR/.venv/bin/pip" install -r "$SCRIPT_DIR/backend/requirements.txt" -q
+  log "Python dependencies ready"
+}
+
 case "${1:-help}" in
   install)
     log "Installing dependencies..."
 
     # Python backend
-    log "Installing Python dependencies..."
-    pip install -r backend/requirements.txt --break-system-packages 2>/dev/null || \
-    pip install -r backend/requirements.txt
+    _ensure_venv
 
     # React frontend
-    log "Installing frontend dependencies with bun..."
+    log "Installing frontend dependencies..."
     cd frontend
     if command -v bun &> /dev/null; then
       bun install
     else
-      warn "bun not found, installing with npm..."
       npm install
     fi
     cd ..
@@ -60,6 +69,9 @@ case "${1:-help}" in
       exit 1
     fi
 
+    # Ensure venv
+    _ensure_venv
+
     # Build UI if not built
     if [ ! -d frontend/dist ]; then
       warn "Frontend not built. Building..."
@@ -69,13 +81,13 @@ case "${1:-help}" in
     # Start the server
     PORT="${SERVER_PORT:-8500}"
     log "Starting server on port $PORT..."
-    python -m uvicorn backend.main:app --host "${SERVER_HOST:-0.0.0.0}" --port "$PORT" --reload
+    $VENV -m uvicorn backend.main:app --host "${SERVER_HOST:-0.0.0.0}" --port "$PORT" --reload
     ;;
 
   start-bg)
     log "Starting Sentinel in background..."
     PORT="${SERVER_PORT:-8500}"
-    nohup python -m uvicorn backend.main:app --host "${SERVER_HOST:-0.0.0.0}" --port "$PORT" \
+    nohup $VENV -m uvicorn backend.main:app --host "${SERVER_HOST:-0.0.0.0}" --port "$PORT" \
       > logs/server.log 2>&1 &
     echo $! > .pid
     log "Started with PID $(cat .pid). Logs: logs/server.log"
@@ -117,9 +129,18 @@ case "${1:-help}" in
   dev)
     log "Starting in dev mode (backend + frontend)..."
 
+    # Ensure deps are installed
+    _ensure_venv
+    if [ ! -d frontend/node_modules ]; then
+      warn "Frontend dependencies not installed..."
+      cd frontend
+      if command -v bun &> /dev/null; then bun install; else npm install; fi
+      cd ..
+    fi
+
     # Start backend
     PORT="${SERVER_PORT:-8500}"
-    python -m uvicorn backend.main:app --host 0.0.0.0 --port "$PORT" --reload &
+    $VENV -m uvicorn backend.main:app --host 0.0.0.0 --port "$PORT" --reload &
     BACKEND_PID=$!
     log "Backend started on port $PORT (PID: $BACKEND_PID)"
 

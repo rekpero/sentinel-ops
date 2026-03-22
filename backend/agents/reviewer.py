@@ -524,8 +524,13 @@ class ReviewAgent:
         prs = await self.github.list_prs(state="open", labels=config.GITHUB_BLOG_LABEL)
         logger.info(f"Found {len(prs)} open PRs with '{config.GITHUB_BLOG_LABEL}' label")
 
+        if not prs:
+            logger.info("No open blog PRs found - nothing to review")
+            return
+
         for pr_item in prs:
             pr_number = pr_item.get("number")
+            pr_title = pr_item.get("title", "untitled")
             if not pr_number:
                 continue
 
@@ -540,6 +545,10 @@ class ReviewAgent:
             last_seen = self._tracked_prs.get(pr_number, "")
 
             if latest_sha == last_seen:
+                logger.info(
+                    f"PR #{pr_number} ({pr_title}): no new commits (sha: {latest_sha[:7]}), "
+                    f"checking if ready..."
+                )
                 # No new commits since last review, check if all comments are resolved
                 is_ready = await self.check_if_blog_ready(pr_number)
                 if is_ready:
@@ -548,10 +557,24 @@ class ReviewAgent:
                         title = topic.get("title", f"PR #{pr_number}")
                         await self.notify_ready(pr_number, title)
                         await self.db.update_topic_status(topic["id"], "ready")
+                        logger.info(f"PR #{pr_number} ({pr_title}): marked as ready!")
+                    else:
+                        logger.info(f"PR #{pr_number} ({pr_title}): already marked ready or no topic")
+                else:
+                    logger.info(f"PR #{pr_number} ({pr_title}): not ready yet, waiting for fixes")
                 continue
 
             # New commits detected - run review
-            logger.info(f"New commits detected on PR #{pr_number} ({last_seen[:7]} -> {latest_sha[:7]})")
+            if last_seen:
+                logger.info(
+                    f"PR #{pr_number} ({pr_title}): new commits detected "
+                    f"({last_seen[:7]} -> {latest_sha[:7]}), starting review..."
+                )
+            else:
+                logger.info(
+                    f"PR #{pr_number} ({pr_title}): first time seeing this PR "
+                    f"(sha: {latest_sha[:7]}), starting review..."
+                )
 
             # Update the repo clone to get the latest changes
             await self.ensure_repo_cloned()
@@ -560,12 +583,14 @@ class ReviewAgent:
             run_id = await self.db.create_agent_run("reviewer", None)
             try:
                 is_ready = await self.review_pr(pr_number)
+                status = "ready" if is_ready else "needs work"
+                logger.info(f"PR #{pr_number} ({pr_title}): review complete - {status}")
                 await self.db.finish_agent_run(
                     run_id, "completed",
                     {"pr_number": pr_number, "ready": is_ready},
                 )
             except Exception as e:
-                logger.error(f"Review failed for PR #{pr_number}: {e}")
+                logger.error(f"Review failed for PR #{pr_number} ({pr_title}): {e}", exc_info=True)
                 await self.db.finish_agent_run(run_id, "error", error=str(e))
 
             # Track this commit

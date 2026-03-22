@@ -53,6 +53,9 @@ def start_scheduler():
     if not scheduler.running:
         scheduler.start()
         logger.info("Scheduler started")
+        # Log next fire times for all jobs
+        for job in scheduler.get_jobs():
+            logger.info(f"  Job '{job.name}': next run at {job.next_run_time}")
 
 
 def stop_scheduler():

@@ -108,18 +108,22 @@ app.add_middleware(
 
 async def run_discovery():
     """Scheduled callback for blog discovery."""
+    logger.info("[cron:discovery] Starting scheduled discovery run...")
     try:
         await discovery_agent.run()
+        logger.info("[cron:discovery] Discovery run completed")
     except Exception as e:
-        logger.error(f"Scheduled discovery failed: {e}")
+        logger.error(f"[cron:discovery] Discovery run failed: {e}", exc_info=True)
 
 
 async def run_review_poll():
     """Scheduled callback for PR review polling."""
+    logger.info("[cron:review-poll] Starting scheduled PR review poll...")
     try:
         await review_agent.poll_prs()
+        logger.info("[cron:review-poll] Review poll completed")
     except Exception as e:
-        logger.error(f"Scheduled review poll failed: {e}")
+        logger.error(f"[cron:review-poll] Review poll failed: {e}", exc_info=True)
 
 
 # === Pydantic Models ===
