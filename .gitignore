@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.timestamp-*
+
+# Data & Runtime
+data/
+workspace/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.pid
+nohup.out
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Keep these tracked
+!.env.example
+!.env.production
