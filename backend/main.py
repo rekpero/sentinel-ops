@@ -3,8 +3,9 @@ Sentinel - FastAPI backend.
 Provides API endpoints for the dashboard and orchestrates the discovery + review agents.
 """
 import asyncio
-import logging
 import json
+import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -42,6 +43,122 @@ discovery_agent: DiscoveryAgent = None
 review_agent: ReviewAgent = None
 
 
+async def _recover_running_agents():
+    """
+    On startup, check all agent runs still marked 'running'.
+    - If the Claude subprocess (PID) is still alive: reattach and continue processing.
+    - If the PID is dead: mark as error (next poll will retry the review).
+    """
+    running = await db.get_running_agent_runs()
+    if not running:
+        return
+
+    logger.info(f"Found {len(running)} agent run(s) in 'running' state at startup")
+
+    for run in running:
+        run_id = run["id"]
+        pid = run.get("pid")
+        log_path = run.get("log_path")
+        log_offset = run.get("log_offset") or 0
+
+        if not pid or not log_path:
+            await db.finish_agent_run(
+                run_id, "error",
+                error="Orphaned: server restarted (no PID recorded, cannot recover)",
+            )
+            logger.warning(f"Run {run_id}: no PID/log recorded - marked as error")
+            continue
+
+        try:
+            os.kill(pid, 0)
+            pid_alive = True
+        except (OSError, ProcessLookupError):
+            pid_alive = False
+
+        if not pid_alive:
+            await db.finish_agent_run(
+                run_id, "error",
+                error=f"Orphaned: Claude process (PID {pid}) died during server restart",
+            )
+            logger.warning(f"Run {run_id}: PID {pid} is dead - marked as error")
+            continue
+
+        logger.info(f"Run {run_id}: PID {pid} still alive - reattaching from offset={log_offset}")
+        ctx = {}
+        try:
+            ctx = json.loads(run.get("recovery_context", "{}") or "{}")
+        except Exception:
+            pass
+
+        asyncio.create_task(_reattach_and_finish(run_id, pid, log_path, log_offset, ctx))
+
+
+async def _reattach_and_finish(
+    run_id: int, pid: int, log_path: str, log_offset: int, ctx: dict
+):
+    """Tail the surviving Claude process log and run post-result logic when it finishes."""
+    try:
+        result = await claude.reattach_run(
+            run_id=run_id,
+            pid=pid,
+            log_path=log_path,
+            log_offset=log_offset,
+            phase=ctx.get("phase", "review"),
+        )
+
+        if ctx.get("type") == "review" and review_agent is not None:
+            pr_number = ctx.get("pr_number")
+            topic_id = ctx.get("topic_id")
+            iteration = ctx.get("iteration", 1)
+            worktree_path = ctx.get("worktree_path", "")
+            head_sha = ctx.get("head_sha", "")
+
+            if pr_number and topic_id:
+                # Try to re-read blog content for pricing check
+                blog_content = ""
+                try:
+                    files = await review_agent.github.get_pr_files(pr_number)
+                    blog_files = [
+                        f for f in files
+                        if any(ext in f.get("filename", "").lower() for ext in [".md", ".mdx"])
+                        and "blog" in f.get("filename", "").lower()
+                    ]
+                    if blog_files and worktree_path:
+                        primary = max(blog_files, key=lambda f: f.get("additions", 0))
+                        fpath = Path(worktree_path) / primary["filename"]
+                        if fpath.exists():
+                            blog_content = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    logger.warning(f"Recovery run {run_id}: could not re-read blog content: {e}")
+
+                is_ready = await review_agent._process_review_result(
+                    pr_number=pr_number,
+                    topic_id=topic_id,
+                    iteration=iteration,
+                    head_sha=head_sha,
+                    blog_content=blog_content,
+                    result=result,
+                )
+                await db.finish_agent_run(
+                    run_id,
+                    "completed",
+                    {"pr_number": pr_number, "recovered": True, "ready": is_ready},
+                )
+                return
+
+        # Generic finish for non-review runs
+        await db.finish_agent_run(
+            run_id,
+            "completed" if result.get("success") else "error",
+            {"recovered": True} if result.get("success") else None,
+            error=result.get("error") if not result.get("success") else None,
+        )
+
+    except Exception as e:
+        logger.error(f"Recovery failed for run {run_id}: {e}", exc_info=True)
+        await db.finish_agent_run(run_id, "error", error=f"Recovery error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
@@ -56,8 +173,8 @@ async def lifespan(app: FastAPI):
     claude = ClaudeService(
         claude_cmd=config.CLAUDE_CMD,
         setup_token=config.CLAUDE_SETUP_TOKEN,
-        max_turns=config.CLAUDE_MAX_TURNS,
         workdir=str(config.WORKDIR),
+        db=db,
     )
     pricing = PricingService(config.SPHERON_PRICING_API)
     swarmops = SwarmOpsService(config.SWARMOPS_URL, config.SWARMOPS_API_KEY)
@@ -69,6 +186,9 @@ async def lifespan(app: FastAPI):
     # Ensure workspace directories exist
     config.WORKDIR.mkdir(parents=True, exist_ok=True)
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Recover any runs that were active when the server last stopped
+    await _recover_running_agents()
 
     # Setup and start scheduler
     setup_scheduler(
@@ -239,16 +359,20 @@ async def trigger_discovery():
 
 @app.post("/api/trigger/review/{pr_number}")
 async def trigger_review(pr_number: int):
-    """Manually trigger review for a specific PR."""
+    """Manually trigger review for a specific PR. Returns run_id for live log streaming."""
+    run_id = await db.create_agent_run("reviewer", None)
+
     async def _review():
         try:
             await review_agent.ensure_repo_cloned()
-            await review_agent.review_pr(pr_number)
+            await review_agent.review_pr(pr_number, run_id=run_id)
+            await db.finish_agent_run(run_id, "completed", {"pr_number": pr_number})
         except Exception as e:
             logger.error(f"Manual review failed: {e}")
+            await db.finish_agent_run(run_id, "error", error=str(e))
 
     asyncio.create_task(_review())
-    return TriggerResponse(message=f"Review started for PR #{pr_number}", success=True)
+    return {"message": f"Review started for PR #{pr_number}", "success": True, "run_id": run_id}
 
 
 @app.post("/api/trigger/review-poll")
@@ -285,16 +409,40 @@ async def list_open_prs():
 # --- Agent Runs ---
 
 @app.get("/api/runs")
-async def list_agent_runs(limit: int = 20):
-    """List recent agent runs."""
+async def list_agent_runs(limit: int = 20, offset: int = 0):
+    """List recent agent runs with pagination."""
     async with __import__("aiosqlite").connect(str(config.DB_PATH)) as conn:
         conn.row_factory = __import__("aiosqlite").Row
         cursor = await conn.execute(
-            "SELECT * FROM agent_runs ORDER BY started_at DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM agent_runs ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
         rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        count_cursor = await conn.execute("SELECT COUNT(*) FROM agent_runs")
+        count_row = await count_cursor.fetchone()
+        total = count_row[0] if count_row else 0
+        return {"runs": [dict(r) for r in rows], "total": total}
+
+
+# --- Agent Run Live Logs ---
+
+@app.get("/api/runs/{run_id}/logs")
+async def get_run_logs(run_id: int, since: int = Query(0)):
+    """
+    Get streaming log events for a specific agent run.
+    Use ?since={id} for cursor-based pagination (returns events with id > since).
+    Poll this endpoint every 2-3 seconds while the run is active.
+    """
+    run_events = await db.get_run_events(run_id, since_id=since, limit=200)
+    # Also return the run status so the frontend knows when to stop polling
+    async with __import__("aiosqlite").connect(str(config.DB_PATH)) as conn:
+        conn.row_factory = __import__("aiosqlite").Row
+        cursor = await conn.execute(
+            "SELECT status, finished_at FROM agent_runs WHERE id = ?", (run_id,)
+        )
+        row = await cursor.fetchone()
+        run_status = dict(row) if row else {"status": "unknown", "finished_at": None}
+    return {"events": run_events, "run_status": run_status["status"], "finished_at": run_status["finished_at"]}
 
 
 # --- Serve React Frontend ---

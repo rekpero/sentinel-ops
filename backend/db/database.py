@@ -74,8 +74,32 @@ class Database:
                     error TEXT,
                     FOREIGN KEY (blog_topic_id) REFERENCES blog_topics(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS agent_run_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    phase TEXT DEFAULT 'general',
+                    event_type TEXT,
+                    event_data TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (run_id) REFERENCES agent_runs(id)
+                );
             """)
             await db.commit()
+
+            # Safe column migrations for existing DBs
+            _migrations = [
+                "ALTER TABLE agent_runs ADD COLUMN pid INTEGER",
+                "ALTER TABLE agent_runs ADD COLUMN log_path TEXT",
+                "ALTER TABLE agent_runs ADD COLUMN log_offset INTEGER DEFAULT 0",
+                "ALTER TABLE agent_runs ADD COLUMN recovery_context TEXT DEFAULT '{}'",
+            ]
+            for sql in _migrations:
+                try:
+                    await db.execute(sql)
+                    await db.commit()
+                except Exception:
+                    pass  # Column already exists
 
     # === Blog Topics ===
 
@@ -222,6 +246,15 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+    async def set_agent_run_pr(self, run_id: int, pr_number: int):
+        """Store pr_number in result JSON immediately so it's visible while running."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE agent_runs SET result = ? WHERE id = ?",
+                (json.dumps({"pr_number": pr_number}), run_id),
+            )
+            await db.commit()
+
     async def finish_agent_run(self, run_id: int, status: str = "completed",
                                result: dict = None, error: str = None):
         async with aiosqlite.connect(self.db_path) as db:
@@ -231,6 +264,66 @@ class Database:
                 (status, json.dumps(result or {}), error, run_id),
             )
             await db.commit()
+
+    async def update_agent_run_process(self, run_id: int, pid: int, log_path: str):
+        """Store PID and log path after spawning Claude subprocess."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE agent_runs SET pid = ?, log_path = ? WHERE id = ?",
+                (pid, log_path, run_id),
+            )
+            await db.commit()
+
+    async def update_agent_run_log_offset(self, run_id: int, offset: int):
+        """Persist current log byte offset for restart recovery."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE agent_runs SET log_offset = ? WHERE id = ?",
+                (offset, run_id),
+            )
+            await db.commit()
+
+    async def update_agent_run_recovery_context(self, run_id: int, context: dict):
+        """Store recovery context so the run can be resumed after restart."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE agent_runs SET recovery_context = ? WHERE id = ?",
+                (json.dumps(context), run_id),
+            )
+            await db.commit()
+
+    async def get_running_agent_runs(self) -> list[dict]:
+        """Get all agent runs still marked running (for startup recovery)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM agent_runs WHERE status = 'running' ORDER BY started_at ASC"
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    # === Agent Run Events (streaming logs) ===
+
+    async def insert_run_event(self, run_id: int, phase: str, event_type: str, event_data: str) -> int:
+        """Insert a single streaming event for an agent run."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT INTO agent_run_events (run_id, phase, event_type, event_data) VALUES (?, ?, ?, ?)",
+                (run_id, phase, event_type, event_data),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_run_events(self, run_id: int, since_id: int = 0, limit: int = 200) -> list[dict]:
+        """Retrieve streaming events for a run, cursor-based (id > since_id)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM agent_run_events WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+                (run_id, since_id, limit),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
     # === Dashboard Stats ===
 

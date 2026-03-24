@@ -3,20 +3,16 @@ Blog Review Agent - monitors PRs labeled 'blog', performs editorial review,
 fact-checking, pricing verification, and iterates until the blog is ready.
 
 Key behaviors:
-- Posts resolvable LINE comments for SwarmOps to act on
-- Posts general PR comments for tagging humans (non-resolvable)
+- Single Claude Code session does fact-check + editorial + posts resolvable inline comment
 - Monitors commits and re-reviews until satisfied
-- Resolves comments when issues are fixed
-- Tags @rekpero when the blog is ready to merge
+- Tags reviewer when the blog is ready to merge
 """
 import asyncio
 import json
 import logging
 import re
 import subprocess
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from backend.services.github_service import GitHubService
 from backend.services.claude_service import ClaudeService
@@ -26,8 +22,6 @@ from backend import config
 
 logger = logging.getLogger(__name__)
 
-# Minimum score to consider a blog ready
-MIN_ACCEPTABLE_SCORE = 7.5
 
 
 class ReviewAgent:
@@ -44,13 +38,73 @@ class ReviewAgent:
         self.db = db
         self._tracked_prs: dict[int, str] = {}  # pr_number -> last_seen_commit_sha
 
+    # === Worktree management ===
+
+    def _pr_worktree_path(self, pr_number: int) -> Path:
+        return config.WORKDIR / "pr-reviews" / f"pr-{pr_number}"
+
+    async def setup_pr_worktree(self, pr_number: int) -> tuple[str, str]:
+        """
+        Fetch the PR branch and create a git worktree so blog files
+        actually exist on disk for Claude to read.
+        Returns (worktree_path, branch_name). Path is empty string on failure.
+        """
+        pr_data = await self.github.get_pr(pr_number)
+        branch = pr_data.get("head", {}).get("ref", "")
+        if not branch:
+            logger.error(f"Could not determine branch for PR #{pr_number}")
+            return "", ""
+
+        worktree_path = self._pr_worktree_path(pr_number)
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove any stale worktree first
+        if worktree_path.exists():
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_path), "--force"],
+                cwd=str(config.REPO_CLONE_DIR), capture_output=True, timeout=30,
+            )
+
+        # Fetch the branch
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", branch],
+            cwd=str(config.REPO_CLONE_DIR), capture_output=True, text=True, timeout=60,
+            env={**subprocess.os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if fetch.returncode != 0:
+            logger.error(f"git fetch failed: {fetch.stderr}")
+            return "", branch
+
+        # Create worktree checked out to the PR branch
+        result = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree_path), f"origin/{branch}"],
+            cwd=str(config.REPO_CLONE_DIR), capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error(f"git worktree add failed: {result.stderr}")
+            return "", branch
+
+        logger.info(f"PR #{pr_number}: worktree created at {worktree_path} (branch: {branch})")
+        return str(worktree_path), branch
+
+    def cleanup_pr_worktree(self, pr_number: int):
+        """Remove the git worktree created for this PR review."""
+        worktree_path = self._pr_worktree_path(pr_number)
+        if worktree_path.exists():
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_path), "--force"],
+                cwd=str(config.REPO_CLONE_DIR), capture_output=True, timeout=30,
+            )
+            logger.info(f"PR #{pr_number}: cleaned up worktree at {worktree_path}")
+
+    # === Repository helpers ===
+
     async def ensure_repo_cloned(self):
         """Clone or update the target repository for full context."""
         repo_dir = config.REPO_CLONE_DIR
         repo_dir.parent.mkdir(parents=True, exist_ok=True)
 
         if repo_dir.exists() and (repo_dir / ".git").exists():
-            # Pull latest
             logger.info("Updating repository clone...")
             result = subprocess.run(
                 ["git", "pull", "--rebase"],
@@ -61,7 +115,6 @@ class ReviewAgent:
             if result.returncode != 0:
                 logger.warning(f"Git pull failed: {result.stderr}")
         else:
-            # Clone fresh
             logger.info(f"Cloning repository {config.GITHUB_REPO}...")
             clone_url = f"https://x-access-token:{config.GITHUB_TOKEN}@github.com/{config.GITHUB_REPO}.git"
             result = subprocess.run(
@@ -95,345 +148,226 @@ class ReviewAgent:
         except Exception as e:
             logger.warning(f"Could not scan for existing blogs: {e}")
 
-        return "\n".join(context_lines[:50])  # Limit context size
+        return "\n".join(context_lines[:50])
 
-    async def get_pr_blog_content(self, pr_number: int) -> tuple[str, list[dict]]:
+    # === Content extraction ===
+
+    async def get_pr_blog_content(self, pr_number: int, worktree_path: str = "") -> tuple[str, list[dict], str]:
         """
-        Get the blog content from a PR's changed files.
-        Returns (content, files) where files is the list of changed file info.
+        Get the primary blog content from a PR's changed files.
+        Identifies the PRIMARY blog (most additions = new blog, not backlink edits).
+        Reads from worktree_path where the PR branch is checked out.
+        Returns (content, all_blog_files, abs_primary_file_path).
         """
         files = await self.github.get_pr_files(pr_number)
+        blog_files = [
+            f for f in files
+            if any(ext in f.get("filename", "").lower() for ext in [".md", ".mdx"])
+            and "blog" in f.get("filename", "").lower()
+        ]
+
+        if not blog_files:
+            return "", [], ""
+
+        # Primary blog = most additions (new blog >> backlink edits)
+        primary_file = max(blog_files, key=lambda f: f.get("additions", 0))
+        primary_path = primary_file.get("filename", "")
+        logger.info(
+            f"PR #{pr_number}: primary blog = {primary_path} ({primary_file.get('additions', 0)} additions)"
+        )
+        for bf in blog_files:
+            if bf["filename"] != primary_path:
+                logger.info(f"  Skipping backlink edit: {bf['filename']} ({bf.get('additions', 0)} additions)")
+
         blog_content = ""
-        blog_files = []
+        base = Path(worktree_path) if worktree_path else None
 
-        for f in files:
-            filename = f.get("filename", "")
-            # Look for blog content files (MD, MDX, etc.)
-            if any(ext in filename.lower() for ext in [".md", ".mdx"]) and "blog" in filename.lower():
-                blog_files.append(f)
-                # Try to read the actual file content from the repo
-                patch = f.get("patch", "")
-                if patch:
-                    # Extract added lines from the patch
-                    added_lines = []
-                    for line in patch.split("\n"):
-                        if line.startswith("+") and not line.startswith("+++"):
-                            added_lines.append(line[1:])
-                    blog_content += "\n".join(added_lines) + "\n"
+        # Read directly from worktree (branch is checked out there)
+        if base and base.exists():
+            fpath = base / primary_path
+            if fpath.exists():
+                blog_content = fpath.read_text(encoding="utf-8", errors="replace")
+                logger.info(f"Read {len(blog_content)} chars from worktree: {fpath}")
+            else:
+                logger.warning(f"File not found in worktree: {fpath}")
 
-        # If we have the repo cloned, try to read the full file
-        if blog_files and config.REPO_CLONE_DIR.exists():
-            pr_data = await self.github.get_pr(pr_number)
-            branch = pr_data.get("head", {}).get("ref", "")
-            if branch:
-                try:
-                    subprocess.run(
-                        ["git", "fetch", "origin", branch],
-                        cwd=str(config.REPO_CLONE_DIR),
-                        capture_output=True, timeout=30,
-                    )
-                    for bf in blog_files:
-                        fpath = config.REPO_CLONE_DIR / bf["filename"]
-                        result = subprocess.run(
-                            ["git", "show", f"origin/{branch}:{bf['filename']}"],
-                            cwd=str(config.REPO_CLONE_DIR),
-                            capture_output=True, text=True, timeout=10,
-                        )
-                        if result.returncode == 0:
-                            blog_content = result.stdout
-                            break
-                except Exception as e:
-                    logger.warning(f"Could not read full file from branch: {e}")
+        # Fallback: extract added lines from the patch
+        if not blog_content:
+            patch = primary_file.get("patch", "")
+            if patch:
+                added_lines = [
+                    line[1:] for line in patch.split("\n")
+                    if line.startswith("+") and not line.startswith("+++")
+                ]
+                blog_content = "\n".join(added_lines)
+                logger.info(f"Fallback: extracted {len(added_lines)} added lines from patch")
 
-        return blog_content, blog_files
+        abs_primary_path = str((base / primary_path) if base else Path(primary_path))
+        return blog_content, blog_files, abs_primary_path
+
+    # === Ready check ===
 
     def _strip_emdashes(self, text: str) -> str:
         """Remove all emdashes from text, replace with hyphens."""
         return text.replace("\u2014", "-").replace("\u2013", "-").replace("--", "-")
 
-    async def perform_editorial_review(self, pr_number: int, blog_content: str) -> dict:
-        """Run Claude Code editorial review on the blog."""
-        existing_context = await self.get_existing_blogs_context()
-
-        result = await self.claude.review_blog(
-            blog_content=blog_content,
-            repo_path=str(config.REPO_CLONE_DIR),
-            existing_blogs_context=existing_context,
-        )
-
-        if not result.get("success"):
-            logger.error(f"Editorial review failed: {result.get('error')}")
-            return {}
-
-        # Parse the review result
-        raw = result.get("result", "")
-        if isinstance(raw, dict):
-            raw = raw.get("result", "") or raw.get("text", "") or json.dumps(raw)
-
-        try:
-            json_match = re.search(r'\{[\s\S]*\}', str(raw))
-            if json_match:
-                review = json.loads(json_match.group())
-                return review
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.error(f"Failed to parse review result: {e}")
-
-        return {}
-
-    async def perform_fact_check(self, pr_number: int, blog_content: str) -> dict:
-        """Run Claude Code fact-check on the blog."""
-        result = await self.claude.fact_check_blog(
-            blog_content=blog_content,
-            repo_path=str(config.REPO_CLONE_DIR),
-        )
-
-        if not result.get("success"):
-            logger.error(f"Fact check failed: {result.get('error')}")
-            return {}
-
-        raw = result.get("result", "")
-        if isinstance(raw, dict):
-            raw = raw.get("result", "") or raw.get("text", "") or json.dumps(raw)
-
-        try:
-            json_match = re.search(r'\{[\s\S]*\}', str(raw))
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        return {}
-
-    async def check_pricing(self, blog_content: str) -> tuple[list[dict], str]:
-        """Check GPU pricing in the blog against current API prices."""
-        mismatches = await self.pricing.check_blog_pricing(blog_content)
-        pricing_table = await self.pricing.format_pricing_for_comment()
-        return mismatches, pricing_table
-
-    async def post_review_comments(
-        self,
-        pr_number: int,
-        review: dict,
-        fact_check: dict,
-        pricing_mismatches: list[dict],
-        pricing_table: str,
-        blog_files: list[dict],
-    ) -> list[int]:
-        """
-        Post line comments on the PR for SwarmOps to act on.
-        These are resolvable comments tied to specific lines.
-        """
-        commit_sha = await self.github.get_latest_commit_sha(pr_number)
-        if not commit_sha or not blog_files:
-            logger.error("No commit SHA or blog files found for review comments")
-            return []
-
-        # Use the first blog file for line comments
-        blog_file = blog_files[0]
-        filepath = blog_file.get("filename", "")
-        comment_ids = []
-
-        # === Build the main review comment ===
-        score = review.get("overall_score", 0)
-        scores = review.get("scores", {})
-        improvements = review.get("improvements", [])
-        fact_flags = review.get("fact_check_flags", []) + fact_check.get("outdated_items", [])
-        missing_links = review.get("missing_crosslinks", [])
-        stale_data = fact_check.get("stale_data", [])
-
-        # Build editorial review body
-        review_body = self._strip_emdashes(f"""## Blog Review - Editorial & Content Quality
-
-**Overall Score: {score}/10**
-
-| Category | Score |
-|----------|-------|
-| Content Quality | {scores.get('content_quality', 'N/A')}/10 |
-| SEO Optimization | {scores.get('seo_optimization', 'N/A')}/10 |
-| Technical Accuracy | {scores.get('technical_accuracy', 'N/A')}/10 |
-| Readability | {scores.get('readability', 'N/A')}/10 |
-| Internal Linking | {scores.get('internal_linking', 'N/A')}/10 |
-
-**Summary:** {review.get('summary', 'Review complete.')}
-
-### Improvements Needed:
-""")
-
-        for imp in improvements:
-            severity_icon = {"high": "!!!", "medium": "!!", "low": "!"}.get(imp.get("severity", "low"), "!")
-            review_body += self._strip_emdashes(
-                f"\n- [{severity_icon}] **{imp.get('type', 'general').upper()}**: "
-                f"{imp.get('description', '')} - *Suggestion: {imp.get('suggestion', '')}*"
-            )
-
-        if missing_links:
-            review_body += "\n\n### Missing Cross-links:\n"
-            for link in missing_links:
-                review_body += self._strip_emdashes(
-                    f"\n- In \"{link.get('context', '')}\": "
-                    f"Add link to [{link.get('anchor_text', 'docs')}]({link.get('suggested_link', '')})"
-                )
-
-        # Post as line comment (resolvable) on line 1 of the blog file
-        try:
-            comment = await self.github.create_pr_review_comment(
-                pr_number=pr_number,
-                body=review_body,
-                commit_id=commit_sha,
-                path=filepath,
-                line=1,
-            )
-            comment_ids.append(comment.get("id"))
-        except Exception as e:
-            logger.error(f"Failed to post review comment: {e}")
-
-        # === Fact-check and pricing comment ===
-        fact_body = self._strip_emdashes("## Fact-Check & Pricing Update\n\n")
-
-        if fact_flags:
-            fact_body += "### Items to Fact-Check:\n"
-            for item in fact_flags:
-                claim = item.get("claim", item.get("data_point", ""))
-                concern = item.get("concern", item.get("current_info", ""))
-                suggestion = item.get("suggestion", item.get("correction", ""))
-                fact_body += self._strip_emdashes(
-                    f"\n- **Claim:** \"{claim}\"\n  **Concern:** {concern}\n  **Fix:** {suggestion}\n"
-                )
-
-        if stale_data:
-            fact_body += "\n### Stale Data to Update:\n"
-            for item in stale_data:
-                fact_body += self._strip_emdashes(
-                    f"\n- **{item.get('data_point', '')}** - Update to: {item.get('correction', '')} "
-                    f"(Source: {item.get('source', 'N/A')})\n"
-                )
-
-        if pricing_mismatches:
-            fact_body += "\n### GPU Pricing Mismatches:\n"
-            for m in pricing_mismatches:
-                spot_info = f", spot is ${m['current_spot']}/hr" if m.get('current_spot') else ""
-                fact_body += self._strip_emdashes(
-                    f"\n- **{m['display_name']}**: Blog says ${m['mentioned_price']}/hr, "
-                    f"but current on-demand is ${m.get('current_ondemand', 'N/A')}/hr"
-                    f"{spot_info}\n"
-                )
-
-        fact_body += f"\n\n{pricing_table}\n"
-        fact_body += self._strip_emdashes(
-            "\n*Note: Pricing is based on current date and can fluctuate over time "
-            "based on availability of the GPUs.*"
-        )
-
-        fact_body += self._strip_emdashes(
-            "\n\n**Action Required:** Please do full fact check on this blog with websearch "
-            "and webfetch so that there is no outdated or stale data or content mentioned in this blog. "
-            "Do this till you can't find any outdated data and then finally resolve this comment. "
-            "Make sure to remove all the emdashes or whenever you update data, don't use any emdash in the content. "
-            "Also check [current GPU pricing](/pricing/) for live rates."
-        )
-
-        # Post fact-check as another line comment (pick a different line if possible)
-        try:
-            # Use line 5 or whatever is available
-            target_line = min(5, blog_file.get("changes", 10))
-            if target_line < 1:
-                target_line = 1
-            comment = await self.github.create_pr_review_comment(
-                pr_number=pr_number,
-                body=fact_body,
-                commit_id=commit_sha,
-                path=filepath,
-                line=target_line,
-            )
-            comment_ids.append(comment.get("id"))
-        except Exception as e:
-            logger.error(f"Failed to post fact-check comment: {e}")
-            # Fallback: try line 1
-            try:
-                comment = await self.github.create_pr_review_comment(
-                    pr_number=pr_number,
-                    body=fact_body,
-                    commit_id=commit_sha,
-                    path=filepath,
-                    line=1,
-                )
-                comment_ids.append(comment.get("id"))
-            except Exception as e2:
-                logger.error(f"Fallback comment also failed: {e2}")
-
-        return comment_ids
-
     async def check_if_blog_ready(self, pr_number: int) -> bool:
         """
-        Check if the blog is ready by verifying:
-        1. All review comments have been addressed (check for new commits since last review)
-        2. The latest review score is above threshold
-        3. Fact-check and pricing are all resolved
+        Check if the blog is ready:
+        1. No unresolved sentinel review threads (threads posted by our bot)
+        2. No pending CHANGES_REQUESTED reviews
+        3. Latest review score is above threshold
         """
-        # Check unresolved threads
+        sentinel_marker = f"sentinel-review:pr-{pr_number}"
         unresolved = await self.github.get_unresolved_review_threads(pr_number)
-        if unresolved:
-            logger.info(f"PR #{pr_number} still has {len(unresolved)} unresolved threads")
+        # Only count threads that contain our sentinel marker - ignore human reviewer threads
+        sentinel_unresolved = [
+            t for t in unresolved
+            if any(
+                sentinel_marker in c.get("body", "")
+                for c in t.get("comments", {}).get("nodes", [])
+            )
+        ]
+        if sentinel_unresolved:
+            logger.info(f"PR #{pr_number} still has {len(sentinel_unresolved)} unresolved sentinel threads")
             return False
 
-        # Check latest review score
+        try:
+            pr_reviews = await self.github.get_pr_reviews(pr_number)
+            # Latest state per reviewer wins
+            reviewer_states: dict[str, str] = {}
+            for r in pr_reviews:
+                login = r.get("user", {}).get("login", "")
+                state = r.get("state", "")
+                if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                    reviewer_states[login] = state
+            if any(s == "CHANGES_REQUESTED" for s in reviewer_states.values()):
+                logger.info(f"PR #{pr_number} has pending CHANGES_REQUESTED review")
+                return False
+        except Exception as e:
+            logger.warning(f"Could not check PR reviews: {e}")
+
         reviews = await self.db.get_review_logs(pr_number)
         if reviews:
             latest = reviews[-1]
-            if latest.get("score", 0) >= MIN_ACCEPTABLE_SCORE:
+            if latest.get("score", 0) >= config.MIN_ACCEPTABLE_SCORE:
                 return True
 
         return False
 
     async def notify_ready(self, pr_number: int, topic_title: str):
-        """Tag the reviewer that the blog is ready to merge."""
+        """
+        Tag the reviewer that the blog is ready to merge, and resolve all remaining
+        Sentinel review threads so SwarmOps stops treating them as open action items.
+        """
+        # Resolve any still-open review threads as a safety net (the agent should have
+        # done this via GraphQL curl in PATH B, but we do it here too to be sure).
+        sentinel_marker = f"sentinel-review:pr-{pr_number}"
+        try:
+            threads = await self.github.get_unresolved_review_threads(pr_number)
+            for thread in threads:
+                thread_id = thread.get("id", "")
+                if not thread_id:
+                    continue
+                # Only resolve threads that contain our sentinel marker
+                bodies = [
+                    c.get("body", "")
+                    for c in thread.get("comments", {}).get("nodes", [])
+                ]
+                if any(sentinel_marker in b for b in bodies):
+                    await self.github.resolve_review_thread(thread_id)
+                    logger.info(f"PR #{pr_number}: resolved sentinel thread {thread_id}")
+        except Exception as e:
+            logger.warning(f"PR #{pr_number}: could not resolve review threads: {e}")
+
         body = self._strip_emdashes(
             f"@{config.GITHUB_REVIEWER_USERNAME} The blog \"{topic_title}\" has passed all "
             f"editorial reviews, fact-checks, and pricing verifications. "
-            f"It is ready for your final review and merge. "
+            f"It is ready for your final review and merge."
         )
         await self.github.add_pr_comment(pr_number, body)
         logger.info(f"Notified @{config.GITHUB_REVIEWER_USERNAME} that PR #{pr_number} is ready")
 
-    async def review_pr(self, pr_number: int) -> bool:
+    # === Review cycle ===
+
+    async def review_pr(self, pr_number: int, run_id: int = None) -> bool:
         """
         Full review cycle for a single PR.
+        Creates a git worktree for the PR branch, runs the review, then cleans up.
         Returns True if the blog is ready, False if it needs more work.
         """
         logger.info(f"Starting review of PR #{pr_number}")
 
-        # Get the blog content
-        blog_content, blog_files = await self.get_pr_blog_content(pr_number)
+        worktree_path, branch = await self.setup_pr_worktree(pr_number)
+        if not worktree_path:
+            logger.error(f"Failed to create worktree for PR #{pr_number}, aborting review")
+            return False
+
+        try:
+            return await self._do_review(pr_number, worktree_path, run_id)
+        finally:
+            self.cleanup_pr_worktree(pr_number)
+
+    async def _do_review(self, pr_number: int, worktree_path: str, run_id: int = None) -> bool:
+        """Run the full review with the PR branch checked out in worktree_path."""
+        blog_content, blog_files, primary_file_path = await self.get_pr_blog_content(pr_number, worktree_path)
         if not blog_content:
             logger.warning(f"No blog content found in PR #{pr_number}")
             return False
+
+        # Fetch PR data once - used for topic lookup, issue context, and SHA tracking
+        pr_data = await self.github.get_pr(pr_number)
+        pr_title = pr_data.get("title", f"PR #{pr_number}")
+        pr_body = pr_data.get("body", "")
+        head_sha = pr_data.get("head", {}).get("sha", "")
+
+        # Fetch linked issue for review context (what the blog was supposed to cover)
+        issue_context = ""
+        issue_num = None
+        issue_match = re.search(r'#(\d+)', pr_body)
+        if issue_match:
+            issue_num = int(issue_match.group(1))
+            try:
+                issue_data = await self.github.get_issue(issue_num)
+                issue_title = issue_data.get("title", "")
+                issue_body = issue_data.get("body", "")
+                issue_context = f"Issue #{issue_num}: {issue_title}\n\n{issue_body}"
+                logger.info(f"PR #{pr_number}: linked to issue #{issue_num} - {issue_title}")
+            except Exception as e:
+                logger.warning(f"Could not fetch issue #{issue_num}: {e}")
 
         # Get or create topic record
         topic = await self.db.get_topic_by_pr(pr_number)
         topic_id = topic["id"] if topic else None
 
-        if not topic_id:
-            # Try to find by issue reference in PR body
-            pr_data = await self.github.get_pr(pr_number)
-            pr_body = pr_data.get("body", "")
-            issue_match = re.search(r'#(\d+)', pr_body)
-            if issue_match:
-                issue_num = int(issue_match.group(1))
-                topic = await self.db.get_topic_by_issue(issue_num)
-                if topic:
-                    topic_id = topic["id"]
-                    await self.db.update_topic_status(topic_id, "pr_created", pr_number=pr_number)
+        if not topic_id and issue_num:
+            found = await self.db.get_topic_by_issue(issue_num)
+            if found:
+                topic_id = found["id"]
+                await self.db.update_topic_status(topic_id, "pr_created", pr_number=pr_number)
 
         if not topic_id:
-            # Create a new topic entry for this PR
-            pr_data = await self.github.get_pr(pr_number)
-            topic_id = await self.db.create_topic(
-                title=pr_data.get("title", f"PR #{pr_number}"),
-            )
+            topic_id = await self.db.create_topic(title=pr_title)
             await self.db.update_topic_status(topic_id, "reviewing", pr_number=pr_number)
 
-        # Get current iteration
-        iteration = await self.db.get_latest_review_iteration(pr_number) + 1
+        # Derive iteration from GitHub directly - check if a sentinel comment already exists.
+        # This is more reliable than the DB counter because DB writes can be skipped on timeout.
+        sentinel_marker = f"sentinel-review:pr-{pr_number}"
+        sentinel_comment_exists = False
+        try:
+            existing_comments = await self.github.list_review_comments(pr_number)
+            sentinel_comment_exists = any(
+                sentinel_marker in c.get("body", "") for c in existing_comments
+            )
+        except Exception as e:
+            logger.warning(f"Could not check existing sentinel comment: {e}")
+
+        db_iteration = await self.db.get_latest_review_iteration(pr_number)
+        # If GitHub has our comment but DB shows 0, we must be on iteration >= 2
+        if sentinel_comment_exists and db_iteration == 0:
+            iteration = 2
+        else:
+            iteration = db_iteration + 1
 
         if iteration > config.MAX_REVIEW_ITERATIONS:
             logger.warning(f"PR #{pr_number} exceeded max review iterations ({config.MAX_REVIEW_ITERATIONS})")
@@ -447,80 +381,168 @@ class ReviewAgent:
             await self.db.update_topic_status(topic_id, "needs_human")
             return False
 
-        # Update status
         await self.db.update_topic_status(topic_id, "reviewing")
 
-        # Run editorial review and fact-check in parallel
-        editorial_task = self.perform_editorial_review(pr_number, blog_content)
-        fact_task = self.perform_fact_check(pr_number, blog_content)
-        pricing_task = self.check_pricing(blog_content)
+        # Single Claude session: fact-check + editorial review + post inline comment
+        existing_context = await self.get_existing_blogs_context()
 
-        review, fact_check, (pricing_mismatches, pricing_table) = await asyncio.gather(
-            editorial_task, fact_task, pricing_task
+        # Fetch authoritative per-GPU pricing BEFORE spawning Claude so we can
+        # pass it directly into the prompt - Claude must not try to fetch pricing itself.
+        try:
+            pricing_context = await self.pricing.format_pricing_for_prompt()
+            logger.info(f"PR #{pr_number}: fetched pricing context ({len(pricing_context)} chars)")
+        except Exception as e:
+            pricing_context = "Pricing data unavailable - skip pricing verification this iteration."
+            logger.warning(f"PR #{pr_number}: could not fetch pricing: {e}")
+
+        # Store recovery context before spawning so a server restart can resume this run
+        if run_id:
+            await self.db.update_agent_run_recovery_context(run_id, {
+                "type": "review",
+                "pr_number": pr_number,
+                "worktree_path": worktree_path,
+                "iteration": iteration,
+                "topic_id": topic_id,
+                "head_sha": head_sha,
+                "phase": "review",
+            })
+
+        result = await self.claude.full_pr_review(
+            primary_file_path=primary_file_path,
+            repo_path=worktree_path,
+            github_token=config.GITHUB_TOKEN,
+            github_repo=config.GITHUB_REPO,
+            pr_number=pr_number,
+            existing_blogs_context=existing_context,
+            issue_context=issue_context,
+            pricing_context=pricing_context,
+            iteration=iteration,
+            sentinel_marker=sentinel_marker,
+            run_id=run_id,
+            timeout=config.REVIEW_TIMEOUT_SECONDS,
         )
 
-        # Calculate overall score
-        score = review.get("overall_score", 0)
+        return await self._process_review_result(
+            pr_number=pr_number,
+            topic_id=topic_id,
+            iteration=iteration,
+            head_sha=head_sha,
+            blog_content=blog_content,
+            result=result,
+        )
 
-        # Log the review
+    async def _process_review_result(
+        self,
+        pr_number: int,
+        topic_id: int,
+        iteration: int,
+        head_sha: str,
+        blog_content: str,
+        result: dict,
+    ) -> bool:
+        """
+        Process the result from a completed Claude review session.
+        Shared between normal flow and post-restart recovery.
+        Returns True if the blog is ready to merge.
+        """
+        if not result.get("success"):
+            logger.error(f"Review agent failed: {result.get('error')}")
+            return False
+
+        # Parse the JSON summary Claude returns at the end
+        raw = result.get("result", "")
+        if isinstance(raw, dict):
+            raw = raw.get("result", "") or raw.get("text", "") or json.dumps(raw)
+
+        review = {}
+        try:
+            json_match = re.search(r'\{[\s\S]*\}', str(raw))
+            if json_match:
+                review = json.loads(json_match.group())
+                logger.info(
+                    f"[review] score={review.get('overall_score')}, "
+                    f"improvements={len(review.get('improvements', []))}, "
+                    f"comment_posted={review.get('comment_posted')}"
+                )
+            else:
+                logger.error("[review] No JSON summary found in Claude output")
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"[review] Failed to parse result JSON: {e}")
+
+        score = review.get("overall_score", 0)
+        improvements = review.get("improvements") or []
+        outdated = (review.get("outdated_items") or []) + (review.get("fact_check_flags") or [])
+        stale = review.get("stale_data") or []
+
+        # Pricing mismatches are now flagged by Claude using the pre-fetched pricing table.
+        # They appear as entries in improvements/outdated with "pricing" in their text.
+        pricing_issues = review.get("pricing_issues") or []
+
+        # Broken or mismatched links in the blog are hard blockers
+        link_audit = review.get("link_audit") or []
+        bad_links = [item for item in link_audit if isinstance(item, dict) and item.get("verdict") in ("BROKEN", "MISMATCH")]
+
+        has_issues = (
+            len(improvements) > 0
+            or len(outdated) > 0
+            or len(stale) > 0
+            or len(pricing_issues) > 0
+            or len(bad_links) > 0
+        )
+        logger.info(
+            f"PR #{pr_number} decision: score={score}, has_issues={has_issues}, "
+            f"improvements={len(improvements)}, outdated={len(outdated)}, "
+            f"stale={len(stale)}, pricing_issues={len(pricing_issues)}, "
+            f"bad_links={len(bad_links)} (broken/mismatch out of {len(link_audit)} audited)"
+        )
+
         await self.db.create_review_log(
             topic_id=topic_id,
             pr_number=pr_number,
             iteration=iteration,
             review_type="full",
             score=score,
-            review_data={
-                "editorial": review,
-                "fact_check": fact_check,
-                "pricing_mismatches": pricing_mismatches,
-            },
+            review_data={"review": review, "pricing_issues": pricing_issues, "head_sha": head_sha, "link_audit": link_audit, "bad_links": bad_links},
         )
         await self.db.update_topic_status(topic_id, "reviewing",
                                           review_score=score,
                                           review_iterations=iteration)
 
-        # Check if blog needs work
-        has_issues = (
-            len(review.get("improvements", [])) > 0
-            or len(fact_check.get("outdated_items", [])) > 0
-            or len(fact_check.get("stale_data", [])) > 0
-            or len(pricing_mismatches) > 0
-        )
-
-        if has_issues or score < MIN_ACCEPTABLE_SCORE:
-            # Post review comments for SwarmOps to act on
-            comment_ids = await self.post_review_comments(
-                pr_number=pr_number,
-                review=review,
-                fact_check=fact_check,
-                pricing_mismatches=pricing_mismatches,
-                pricing_table=pricing_table,
-                blog_files=blog_files,
-            )
-            logger.info(
-                f"PR #{pr_number} review iteration {iteration}: "
-                f"Score {score}/10, posted {len(comment_ids)} comments"
-            )
+        if has_issues or score < config.MIN_ACCEPTABLE_SCORE:
+            logger.info(f"PR #{pr_number} iteration {iteration}: score={score}/10, needs work")
             return False
         else:
-            # Blog is good!
-            topic = await self.db.get_topic(topic_id)
-            title = topic.get("title", f"PR #{pr_number}") if topic else f"PR #{pr_number}"
-            await self.notify_ready(pr_number, title)
+            topic_rec = await self.db.get_topic(topic_id)
+            title = topic_rec.get("title", f"PR #{pr_number}") if topic_rec else f"PR #{pr_number}"
+            # Mark ready FIRST so the next poll doesn't re-trigger notify_ready if
+            # notify_ready is slow or partially fails.
             await self.db.update_topic_status(topic_id, "ready")
+            try:
+                await self.notify_ready(pr_number, title)
+            except Exception as e:
+                # Status is already "ready" so the blog won't be re-reviewed, but the
+                # human reviewer was not tagged. Log prominently for manual follow-up.
+                logger.error(
+                    f"PR #{pr_number}: notify_ready failed after marking blog ready - "
+                    f"@{config.GITHUB_REVIEWER_USERNAME} must be tagged manually. Error: {e}"
+                )
             return True
+
+    # === Polling ===
 
     async def poll_prs(self):
         """
         Poll for PRs labeled 'blog' and review new/updated ones.
-        This is the main loop for the review agent.
+
+        Two-phase execution:
+          Phase 1 (sequential): check each PR's SHA, seed _tracked_prs, build review queue.
+          Phase 2 (concurrent): run up to MAX_CONCURRENT_REVIEWS reviews in parallel using
+                                 asyncio.Semaphore so each PR gets its own Claude subprocess.
         """
         logger.info("Polling for blog PRs...")
 
-        # Ensure repo is cloned and up to date
         await self.ensure_repo_cloned()
 
-        # Get open PRs with blog label
         prs = await self.github.list_prs(state="open", labels=config.GITHUB_BLOG_LABEL)
         logger.info(f"Found {len(prs)} open PRs with '{config.GITHUB_BLOG_LABEL}' label")
 
@@ -528,13 +550,16 @@ class ReviewAgent:
             logger.info("No open blog PRs found - nothing to review")
             return
 
+        # ── Phase 1: sequential SHA check ────────────────────────────────────
+        # Fast path (no Claude). Build list of PRs that need a full review.
+        review_queue: list[tuple[int, str]] = []  # (pr_number, pr_title)
+
         for pr_item in prs:
             pr_number = pr_item.get("number")
             pr_title = pr_item.get("title", "untitled")
             if not pr_number:
                 continue
 
-            # Get full PR data
             try:
                 pr_data = await self.github.get_pr(pr_number)
             except Exception as e:
@@ -544,12 +569,27 @@ class ReviewAgent:
             latest_sha = pr_data.get("head", {}).get("sha", "")
             last_seen = self._tracked_prs.get(pr_number, "")
 
+            # On first poll after a restart, seed _tracked_prs with the SHA that was
+            # last reviewed (stored in review_data), not the current live SHA.
+            # This ensures new commits pushed while the service was down are still reviewed.
+            if not last_seen:
+                prev_logs = await self.db.get_review_logs(pr_number)
+                if prev_logs:
+                    try:
+                        last_review_data = json.loads(prev_logs[-1].get("review_data", "{}") or "{}")
+                        last_reviewed_sha = last_review_data.get("head_sha", "")
+                    except (json.JSONDecodeError, TypeError):
+                        last_reviewed_sha = ""
+                    if last_reviewed_sha:
+                        self._tracked_prs[pr_number] = last_reviewed_sha
+                        last_seen = last_reviewed_sha
+                        logger.info(
+                            f"PR #{pr_number}: seeded from DB (last reviewed sha={last_reviewed_sha[:7]}, "
+                            f"current sha={latest_sha[:7]})"
+                        )
+
             if latest_sha == last_seen:
-                logger.info(
-                    f"PR #{pr_number} ({pr_title}): no new commits (sha: {latest_sha[:7]}), "
-                    f"checking if ready..."
-                )
-                # No new commits since last review, check if all comments are resolved
+                logger.info(f"PR #{pr_number} ({pr_title}): no new commits, checking if ready...")
                 is_ready = await self.check_if_blog_ready(pr_number)
                 if is_ready:
                     topic = await self.db.get_topic_by_pr(pr_number)
@@ -564,37 +604,54 @@ class ReviewAgent:
                     logger.info(f"PR #{pr_number} ({pr_title}): not ready yet, waiting for fixes")
                 continue
 
-            # New commits detected - run review
             if last_seen:
                 logger.info(
-                    f"PR #{pr_number} ({pr_title}): new commits detected "
-                    f"({last_seen[:7]} -> {latest_sha[:7]}), starting review..."
+                    f"PR #{pr_number} ({pr_title}): new commits "
+                    f"({last_seen[:7]} -> {latest_sha[:7]}), queuing review..."
                 )
             else:
                 logger.info(
                     f"PR #{pr_number} ({pr_title}): first time seeing this PR "
-                    f"(sha: {latest_sha[:7]}), starting review..."
+                    f"(sha: {latest_sha[:7]}), queuing review..."
                 )
 
-            # Update the repo clone to get the latest changes
-            await self.ensure_repo_cloned()
-
-            # Run the review
-            run_id = await self.db.create_agent_run("reviewer", None)
-            try:
-                is_ready = await self.review_pr(pr_number)
-                status = "ready" if is_ready else "needs work"
-                logger.info(f"PR #{pr_number} ({pr_title}): review complete - {status}")
-                await self.db.finish_agent_run(
-                    run_id, "completed",
-                    {"pr_number": pr_number, "ready": is_ready},
-                )
-            except Exception as e:
-                logger.error(f"Review failed for PR #{pr_number} ({pr_title}): {e}", exc_info=True)
-                await self.db.finish_agent_run(run_id, "error", error=str(e))
-
-            # Track this commit
+            # Mark SHA NOW before dispatch so the next scheduled poll (which may fire
+            # while this review is still running) does not re-queue the same commit.
             self._tracked_prs[pr_number] = latest_sha
+            review_queue.append((pr_number, pr_title))
+
+        if not review_queue:
+            return
+
+        # ── Phase 2: concurrent reviews ───────────────────────────────────────
+        concurrency = max(1, config.MAX_CONCURRENT_REVIEWS)
+        logger.info(
+            f"Dispatching {len(review_queue)} review(s) "
+            f"(concurrency={concurrency}): PRs {[n for n, _ in review_queue]}"
+        )
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _run_review(pr_number: int, pr_title: str):
+            async with semaphore:
+                run_id = await self.db.create_agent_run("reviewer", None)
+                # Store pr_number immediately so it shows while the run is still running
+                await self.db.set_agent_run_pr(run_id, pr_number)
+                try:
+                    is_ready = await self.review_pr(pr_number, run_id=run_id)
+                    status = "ready" if is_ready else "needs work"
+                    logger.info(f"PR #{pr_number} ({pr_title}): review complete - {status}")
+                    await self.db.finish_agent_run(
+                        run_id, "completed",
+                        {"pr_number": pr_number, "ready": is_ready},
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Review failed for PR #{pr_number} ({pr_title}): {e}", exc_info=True
+                    )
+                    await self.db.finish_agent_run(run_id, "error", error=str(e))
+
+        await asyncio.gather(*[_run_review(n, t) for n, t in review_queue])
 
     async def run_continuous(self):
         """Run the review agent continuously, polling at configured intervals."""

@@ -1,10 +1,12 @@
 """
 Spheron GPU Pricing Service - fetches current GPU pricing from the Spheron API.
-Supports pagination to get all GPU types.
+
+Per-GPU pricing logic:
+  - Offer HAS spot_price  -> spot instance  -> per_gpu = spot_price  / gpu_count
+  - Offer has NO spot_price -> on-demand     -> per_gpu = price       / gpu_count
 """
 import httpx
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -39,118 +41,132 @@ class PricingService:
 
     async def get_pricing_summary(self) -> dict:
         """
-        Get a clean pricing summary keyed by GPU base type.
-        Returns: {
+        Get per-GPU pricing summary keyed by GPU base type.
+
+        For each individual offer inside a GPU entry:
+          - If the offer has a truthy `spot_price` field -> it is a spot instance.
+            per_gpu_price = spot_price / gpu_count
+          - Otherwise -> it is an on-demand instance.
+            per_gpu_price = price / gpu_count
+
+        Returns the lowest per-GPU price seen across all providers for each type:
+        {
             "H100": {"ondemand": 2.01, "spot": 0.99, "display_name": "H100 SXM5"},
-            "B200": {"ondemand": 6.03, "spot": 2.25, "display_name": "B200 SXM"},
             ...
         }
         """
         offers = await self.fetch_all_gpu_offers()
-        pricing = {}
+        pricing: dict[str, dict] = {}
 
         for gpu in offers:
-            base_type = gpu.get("baseGpuType", gpu.get("gpuType", "unknown"))
+            base_type = gpu.get("baseGpuType") or gpu.get("gpuType") or ""
+            if not base_type:
+                continue
             display_name = gpu.get("displayName", base_type)
             gpu_offers = gpu.get("offers", [])
 
-            ondemand_prices = []
-            spot_prices = []
+            ondemand_prices: list[float] = []
+            spot_prices: list[float] = []
 
             for offer in gpu_offers:
-                instance_type = offer.get("instanceType", "DEDICATED")
-                price = offer.get("price", 0)
-                if instance_type == "SPOT":
-                    spot_prices.append(price)
+                # Support both snake_case and camelCase field names
+                gpu_count = (
+                    offer.get("gpu_count")
+                    or offer.get("gpuCount")
+                    or offer.get("numGpus")
+                    or 1
+                )
+                try:
+                    gpu_count = float(gpu_count)
+                except (TypeError, ValueError):
+                    gpu_count = 1.0
+                if gpu_count <= 0:
+                    gpu_count = 1.0
+
+                spot_price = offer.get("spot_price")
+                if spot_price:
+                    # Spot instance - divide spot_price by gpu_count
+                    try:
+                        per_gpu = float(spot_price) / gpu_count
+                        spot_prices.append(per_gpu)
+                    except (TypeError, ValueError):
+                        pass
                 else:
-                    ondemand_prices.append(price)
+                    # On-demand instance - divide price by gpu_count
+                    price = offer.get("price", 0)
+                    if price:
+                        try:
+                            per_gpu = float(price) / gpu_count
+                            ondemand_prices.append(per_gpu)
+                        except (TypeError, ValueError):
+                            pass
 
-            # Use the lowest available price for each type
-            lowest_ondemand = gpu.get("lowestPrice", 0)
-            if not lowest_ondemand and ondemand_prices:
-                lowest_ondemand = min(ondemand_prices)
+            ondemand = round(min(ondemand_prices), 4) if ondemand_prices else None
+            spot = round(min(spot_prices), 4) if spot_prices else None
 
-            lowest_spot = min(spot_prices) if spot_prices else None
-
-            # Also check averagePrice as fallback
-            if not lowest_ondemand:
-                lowest_ondemand = gpu.get("averagePrice", 0)
+            if ondemand is None and spot is None:
+                continue
 
             pricing[base_type] = {
-                "ondemand": round(lowest_ondemand, 2) if lowest_ondemand else None,
-                "spot": round(lowest_spot, 2) if lowest_spot else None,
+                "ondemand": ondemand,
+                "spot": spot,
                 "display_name": display_name,
-                "total_available": gpu.get("totalAvailable", 0),
             }
 
         return pricing
 
-    async def format_pricing_for_comment(self) -> str:
-        """Format pricing data for use in PR comments."""
-        pricing = await self.get_pricing_summary()
+    async def format_pricing_for_prompt(self) -> str:
+        """
+        Format per-GPU pricing as a markdown table ready to inject into Claude prompts.
+        Returns a table the agent can use to verify pricing claims in the blog.
+        """
+        try:
+            pricing = await self.get_pricing_summary()
+        except Exception as e:
+            logger.warning(f"Could not fetch pricing for prompt: {e}")
+            return "Pricing data unavailable - skip pricing verification this iteration."
+
+        if not pricing:
+            return "Pricing data unavailable - skip pricing verification this iteration."
+
         lines = [
-            "**Current Spheron GPU Pricing** (as of today, prices fluctuate based on GPU availability):\n",
-            "| GPU | On-Demand ($/hr) | Spot ($/hr) |",
-            "|-----|-------------------|-------------|",
+            "Current Spheron GPU **per-GPU** pricing ($/hr) fetched live from the Spheron API:",
+            "",
+            "| GPU Model | On-Demand $/hr (per GPU) | Spot $/hr (per GPU) |",
+            "|-----------|--------------------------|---------------------|",
         ]
-        # Sort by ondemand price descending
         sorted_gpus = sorted(
             pricing.items(),
             key=lambda x: x[1].get("ondemand") or 0,
             reverse=True,
         )
         for gpu_type, info in sorted_gpus:
-            ondemand = f"${info['ondemand']:.2f}" if info.get("ondemand") else "N/A"
-            spot = f"${info['spot']:.2f}" if info.get("spot") else "N/A"
+            ondemand = f"${info['ondemand']:.2f}" if info.get("ondemand") is not None else "N/A"
+            spot     = f"${info['spot']:.2f}"     if info.get("spot")     is not None else "N/A"
+            lines.append(f"| {info['display_name']} ({gpu_type}) | {ondemand} | {spot} |")
+
+        lines += [
+            "",
+            "Note: prices fluctuate with GPU availability. Always include this disclaimer in the blog.",
+        ]
+        return "\n".join(lines)
+
+    async def format_pricing_for_comment(self) -> str:
+        """Format per-GPU pricing for use in PR comments."""
+        pricing = await self.get_pricing_summary()
+        lines = [
+            "**Current Spheron GPU Pricing** (per GPU/hr, prices fluctuate based on GPU availability):\n",
+            "| GPU | On-Demand ($/hr per GPU) | Spot ($/hr per GPU) |",
+            "|-----|--------------------------|---------------------|",
+        ]
+        sorted_gpus = sorted(
+            pricing.items(),
+            key=lambda x: x[1].get("ondemand") or 0,
+            reverse=True,
+        )
+        for gpu_type, info in sorted_gpus:
+            ondemand = f"${info['ondemand']:.2f}" if info.get("ondemand") is not None else "N/A"
+            spot     = f"${info['spot']:.2f}"     if info.get("spot")     is not None else "N/A"
             lines.append(f"| {info['display_name']} | {ondemand} | {spot} |")
 
         return "\n".join(lines)
-
-    async def check_blog_pricing(self, blog_content: str) -> list[dict]:
-        """
-        Check if any GPU pricing mentioned in the blog matches current API pricing.
-        Returns list of mismatches with corrections.
-        """
-        import re
-
-        pricing = await self.get_pricing_summary()
-        mismatches = []
-
-        for gpu_type, info in pricing.items():
-            # Look for mentions of this GPU type with pricing
-            # Match patterns like "$2.01/hr", "$2.01 per hour", "$2.01/hour"
-            gpu_pattern = re.compile(
-                rf"{re.escape(gpu_type)}[^$]*?\$(\d+\.?\d*)\s*(?:/hr|/hour|per hour)",
-                re.IGNORECASE,
-            )
-            matches = gpu_pattern.findall(blog_content)
-
-            for mentioned_price in matches:
-                mentioned = float(mentioned_price)
-                if info.get("ondemand") and abs(mentioned - info["ondemand"]) > 0.01:
-                    mismatches.append({
-                        "gpu": gpu_type,
-                        "display_name": info["display_name"],
-                        "mentioned_price": mentioned,
-                        "current_ondemand": info["ondemand"],
-                        "current_spot": info.get("spot"),
-                    })
-
-            # Also check spot pricing mentions
-            spot_pattern = re.compile(
-                rf"{re.escape(gpu_type)}[^$]*?spot[^$]*?\$(\d+\.?\d*)",
-                re.IGNORECASE,
-            )
-            spot_matches = spot_pattern.findall(blog_content)
-            for mentioned_price in spot_matches:
-                mentioned = float(mentioned_price)
-                if info.get("spot") and abs(mentioned - info["spot"]) > 0.01:
-                    mismatches.append({
-                        "gpu": gpu_type,
-                        "display_name": info["display_name"],
-                        "mentioned_price": mentioned,
-                        "current_spot": info["spot"],
-                        "type": "spot",
-                    })
-
-        return mismatches

@@ -76,6 +76,12 @@ class GitHubService:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_issue(self, issue_number: int):
+        """Get a single issue."""
+        resp = await self.client.get(f"/repos/{self.repo}/issues/{issue_number}")
+        resp.raise_for_status()
+        return resp.json()
+
     async def get_pr_files(self, pr_number: int):
         """Get files changed in a PR."""
         resp = await self.client.get(
@@ -131,6 +137,7 @@ class GitHubService:
         body: str,
         event: str = "COMMENT",
         comments: list[dict] = None,
+        commit_id: str = "",
     ):
         """
         Create a PR review with multiple line comments at once.
@@ -138,6 +145,8 @@ class GitHubService:
         comments: list of {path, line, side, body}
         """
         data = {"body": body, "event": event}
+        if commit_id:
+            data["commit_id"] = commit_id
         if comments:
             data["comments"] = comments
         resp = await self.client.post(
@@ -146,6 +155,25 @@ class GitHubService:
         )
         resp.raise_for_status()
         return resp.json()
+
+    async def get_pr_reviews(self, pr_number: int):
+        """Get all reviews on a PR (paginated)."""
+        all_reviews = []
+        page = 1
+        while True:
+            resp = await self.client.get(
+                f"/repos/{self.repo}/pulls/{pr_number}/reviews",
+                params={"per_page": 100, "page": page},
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            if not batch:
+                break
+            all_reviews.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return all_reviews
 
     # === General PR Comments (Non-resolvable, for tagging humans) ===
 
@@ -159,13 +187,23 @@ class GitHubService:
     # === Review Comment Management ===
 
     async def list_review_comments(self, pr_number: int):
-        """List all review comments on a PR."""
-        resp = await self.client.get(
-            f"/repos/{self.repo}/pulls/{pr_number}/comments",
-            params={"per_page": 100},
-        )
-        resp.raise_for_status()
-        return resp.json()
+        """List all review comments on a PR (paginated)."""
+        all_comments = []
+        page = 1
+        while True:
+            resp = await self.client.get(
+                f"/repos/{self.repo}/pulls/{pr_number}/comments",
+                params={"per_page": 100, "page": page},
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            if not batch:
+                break
+            all_comments.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return all_comments
 
     async def get_review_comment_replies(self, comment_id: int):
         """Get replies to a specific review comment."""
@@ -178,14 +216,19 @@ class GitHubService:
     # === GraphQL for unresolved threads ===
 
     async def get_unresolved_review_threads(self, pr_number: int):
-        """Use GraphQL to get unresolved review threads."""
+        """Use GraphQL to get unresolved review threads (paginated, includes thread id for resolution)."""
         owner, repo = self.repo.split("/")
         query = """
-        query($owner: String!, $repo: String!, $pr: Int!) {
+        query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
           repository(owner: $owner, name: $repo) {
             pullRequest(number: $pr) {
-              reviewThreads(first: 100) {
+              reviewThreads(first: 100, after: $cursor) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
                 nodes {
+                  id
                   isResolved
                   comments(first: 20) {
                     nodes {
@@ -202,23 +245,65 @@ class GitHubService:
           }
         }
         """
+        all_threads = []
+        cursor = None
+        while True:
+            resp = await self.client.post(
+                "https://api.github.com/graphql",
+                json={
+                    "query": query,
+                    "variables": {"owner": owner, "repo": repo, "pr": pr_number, "cursor": cursor},
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errors"):
+                logger.warning(f"GraphQL get_unresolved_review_threads errors: {data['errors']}")
+            review_threads = (
+                (data.get("data") or {})
+                .get("repository") or {}
+            ).get("pullRequest") or {}
+            review_threads = review_threads.get("reviewThreads") or {}
+            all_threads.extend(review_threads.get("nodes") or [])
+            page_info = review_threads.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+        return [t for t in all_threads if not t.get("isResolved")]
+
+    async def resolve_review_thread(self, thread_id: str) -> bool:
+        """
+        Resolve a PR review thread via GraphQL mutation.
+        thread_id is the GraphQL node ID (e.g. 'PRRT_kwDO...' from get_unresolved_review_threads).
+        Returns True on success.
+        """
+        mutation = """
+        mutation($threadId: ID!) {
+          resolveReviewThread(input: {threadId: $threadId}) {
+            thread {
+              id
+              isResolved
+            }
+          }
+        }
+        """
         resp = await self.client.post(
             "https://api.github.com/graphql",
-            json={
-                "query": query,
-                "variables": {"owner": owner, "repo": repo, "pr": pr_number},
-            },
+            json={"query": mutation, "variables": {"threadId": thread_id}},
         )
         resp.raise_for_status()
         data = resp.json()
-        threads = (
+        if data.get("errors"):
+            logger.error(f"GraphQL resolveReviewThread errors: {data['errors']}")
+            return False
+        resolved = (
             data.get("data", {})
-            .get("repository", {})
-            .get("pullRequest", {})
-            .get("reviewThreads", {})
-            .get("nodes", [])
+            .get("resolveReviewThread", {})
+            .get("thread", {})
+            .get("isResolved", False)
         )
-        return [t for t in threads if not t.get("isResolved")]
+        logger.info(f"Resolved review thread {thread_id}: isResolved={resolved}")
+        return resolved
 
     # === Commits ===
 

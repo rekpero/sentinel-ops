@@ -35,6 +35,8 @@ DISCOVERY_CRON_MINUTE = int(os.getenv("DISCOVERY_CRON_MINUTE", "0"))
 DISCOVERY_TOPIC_COUNT = int(os.getenv("DISCOVERY_TOPIC_COUNT", "3"))
 PR_POLL_INTERVAL_SECONDS = int(os.getenv("PR_POLL_INTERVAL_SECONDS", "120"))
 MAX_REVIEW_ITERATIONS = int(os.getenv("MAX_REVIEW_ITERATIONS", "5"))
+MIN_ACCEPTABLE_SCORE = float(os.getenv("MIN_ACCEPTABLE_SCORE", "7.5"))
+MAX_CONCURRENT_REVIEWS = int(os.getenv("MAX_CONCURRENT_REVIEWS", "1"))
 
 # === Workspace ===
 BASE_DIR = Path(os.getenv("BASE_DIR", str(Path(__file__).parent.parent)))
@@ -53,3 +55,4 @@ SERVER_PORT = int(os.getenv("SERVER_PORT", "8500"))
 # === Claude Code ===
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "claude")
 CLAUDE_MAX_TURNS = int(os.getenv("CLAUDE_MAX_TURNS", "30"))
+REVIEW_TIMEOUT_SECONDS = int(os.getenv("REVIEW_TIMEOUT_SECONDS", "1200"))  # 20 min default

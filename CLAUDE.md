@@ -49,6 +49,13 @@ sentinel/
 - Cross-link to `docs.spheron.ai` wherever technical concepts are mentioned.
 - Cross-link to existing blog posts on `spheron.network/blog/` where relevant.
 
+### Link Verification Rules (CRITICAL)
+- The reviewer agent MUST NOT suggest a specific URL in review comments unless it has fetched that URL with WebFetch and confirmed: (a) the page exists, AND (b) the content is actually relevant to the context where it would be inserted.
+- If a link cannot be verified, the reviewer must flag it with: "NOTE TO AGENT: Before adding this link, use WebFetch to fetch [URL] and confirm the page exists and is relevant to the surrounding content."
+- The reviewer must never fabricate or guess doc/blog URLs. If unsure of the exact URL, describe the concept to link to and let the writing agent find the right URL.
+- Existing Spheron blog slugs in `existing_blogs_context` are candidates only - they must still be WebFetched to confirm relevance before being suggested as cross-links.
+- Rationale: the SwarmOps writing agent blindly trusts review suggestions. A broken or irrelevant link in a review comment will be inserted into the published blog.
+
 ### GitHub Comment Rules
 - **Resolvable line comments** (via `create_pr_review_comment`): Used for actionable feedback that SwarmOps should fix. These are tied to specific file lines and can be resolved after fixes are applied. This is how SwarmOps picks up work.
 - **General PR comments** (via `add_pr_comment`): Used for tagging humans (e.g., `@rekpero`) and status updates. These cannot be resolved. Never use these for SwarmOps-actionable feedback.
@@ -152,3 +159,30 @@ When modifying the frontend:
 - **Claude Code not found**: Ensure the `claude` CLI is installed and available in PATH, or set `CLAUDE_CMD` to the full path.
 - **GitHub rate limiting**: The PR poll interval defaults to 120 seconds. Increase `PR_POLL_INTERVAL_SECONDS` if hitting rate limits.
 - **SwarmOps auth**: If SwarmOps requires authentication, set `SWARMOPS_API_KEY` or use the authenticate method with username/password.
+
+## Design Context
+
+### Users
+Solo founder / operator running an automated blog pipeline. Opens the dashboard to get full situational awareness: where is each piece of content in the pipeline, are agents running, are there PRs waiting review. Emotional goal: **control and confidence** - pipeline health visible within 2 seconds.
+
+### Brand Personality
+Precise · Operational · Minimal
+
+### Aesthetic Direction
+Clean SaaS / Vercel-like. Very dark almost-black backgrounds with subtle cool-blue tint. Amber/gold (`#e8a530`) as the single accent color - reserved exclusively for interactive and active states, never decorative. Status colors (success/warning/error/info) are separate from the brand accent.
+
+Anti-patterns to avoid:
+- No purple-to-cyan gradients or neon accents
+- No glassmorphism, glow effects
+- No identical stat cards with big numbers (hero metric layout)
+- No rounded elements with colored border on one side
+
+Fonts: **Syne** (brand/display) · **DM Sans** (UI body) · **JetBrains Mono** (terminal/logs only)
+Theme: Dark only.
+
+### Design Principles
+1. **Density with clarity** - Maximum useful information without confusion. Every element earns its place.
+2. **Amber as signal** - Accent reserved for interactive/active states only. Never decorative.
+3. **Flow visibility** - Pipeline status always visible at the top of the page.
+4. **Quiet by default** - UI is calm/understated. Animations and colors activate only when relevant.
+5. **Trust through precision** - Every value, timestamp, and status is exact. No vague states.

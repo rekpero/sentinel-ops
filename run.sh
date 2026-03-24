@@ -93,6 +93,57 @@ case "${1:-help}" in
     log "Started with PID $(cat .pid). Logs: logs/server.log"
     ;;
 
+  restart)
+    log "Restarting Sentinel..."
+
+    # Stop if running
+    if [ -f .pid ]; then
+      PID=$(cat .pid)
+      if kill -0 "$PID" 2>/dev/null; then
+        log "Stopping PID $PID..."
+        kill "$PID"
+        rm .pid
+      else
+        rm .pid
+      fi
+    fi
+
+    # Check for .env
+    if [ ! -f .env ]; then
+      warn "No .env file found. Copy .env.example to .env and configure your tokens."
+      exit 1
+    fi
+
+    # Install/update dependencies
+    _ensure_venv
+    log "Installing frontend dependencies..."
+    cd frontend
+    if command -v bun &> /dev/null; then
+      bun install
+    else
+      npm install
+    fi
+
+    # Rebuild frontend
+    log "Building frontend..."
+    if command -v bun &> /dev/null; then
+      bun run build
+    else
+      npx vite build
+    fi
+    cd ..
+    log "Frontend built"
+
+    # Start in background
+    mkdir -p logs
+    PORT="${SERVER_PORT:-8500}"
+    log "Starting server on port $PORT (background)..."
+    nohup $VENV -m uvicorn backend.main:app --host "${SERVER_HOST:-0.0.0.0}" --port "$PORT" \
+      > logs/server.log 2>&1 &
+    echo $! > .pid
+    log "Restarted with PID $(cat .pid). Logs: logs/server.log"
+    ;;
+
   stop)
     if [ -f .pid ]; then
       PID=$(cat .pid)
@@ -172,6 +223,7 @@ case "${1:-help}" in
     echo "  build-ui   Build the React frontend"
     echo "  start      Start the server (foreground)"
     echo "  start-bg   Start the server (background)"
+    echo "  restart    Rebuild frontend + restart server (background)"
     echo "  stop       Stop the background server"
     echo "  status     Check if server is running"
     echo "  logs       Tail server logs"

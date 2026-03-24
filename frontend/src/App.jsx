@@ -1,94 +1,428 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 
 const API = '/api'
+const PAGE_SIZE = 20
 
+// ── Status maps ──────────────────────────────────────────────────────────────
 const STATUS_COLORS = {
-  discovered: '#8b5cf6',
-  planning: '#f59e0b',
-  planning_failed: '#ef4444',
-  issue_created: '#3b82f6',
-  writing: '#6366f1',
-  pr_created: '#06b6d4',
-  reviewing: '#f97316',
-  ready: '#10b981',
-  completed: '#22c55e',
-  needs_human: '#ef4444',
+  discovered:      '#9b78e4',
+  planning:        '#e8a530',
+  planning_failed: '#e04848',
+  issue_created:   '#4494dd',
+  writing:         '#7b7aff',
+  pr_created:      '#28b4b4',
+  reviewing:       '#e07830',
+  ready:           '#2db882',
+  completed:       '#22c55e',
+  needs_human:     '#e04848',
 }
-
 const STATUS_LABELS = {
-  discovered: 'Discovered',
-  planning: 'Planning',
+  discovered:      'Discovered',
+  planning:        'Planning',
   planning_failed: 'Plan Failed',
-  issue_created: 'Issue Created',
-  writing: 'Writing',
-  pr_created: 'PR Created',
-  reviewing: 'Reviewing',
-  ready: 'Ready to Merge',
-  completed: 'Completed',
-  needs_human: 'Needs Human',
+  issue_created:   'Issue Created',
+  writing:         'Writing',
+  pr_created:      'PR Created',
+  reviewing:       'Reviewing',
+  ready:           'Ready',
+  completed:       'Completed',
+  needs_human:     'Needs Human',
+}
+const EVENT_TYPE_COLOR = {
+  assistant:        '#9b78e4',
+  tool_use:         '#e8a530',
+  tool_result:      '#384458',
+  result:           '#2db882',
+  error:            '#e04848',
+  system:           '#4494dd',
+  user:             '#384458',
+  rate_limit_event: '#e8a530',
 }
 
+// Pipeline stages shown in the top flow bar
+const PIPELINE_STAGES = [
+  { key: 'discovered', label: 'Discovered', color: '#9b78e4' },
+  { key: 'writing',    label: 'Writing',    color: '#7b7aff' },
+  { key: 'reviewing',  label: 'Reviewing',  color: '#e07830', pulse: true },
+  { key: 'ready',      label: 'Ready',      color: '#2db882' },
+  { key: 'completed',  label: 'Completed',  color: '#22c55e' },
+]
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+function formatToolUse(b) {
+  const tool = b.name || 'unknown'
+  const input = b.input || {}
+  if (tool === 'Bash')      return `$ ${(input.command || '').substring(0, 120)}`
+  if (tool === 'Read')      return `Read ${input.file_path || '?'}`
+  if (tool === 'Edit' || tool === 'Write') return `${tool} ${input.file_path || '?'}`
+  if (tool === 'Grep')      return `Grep "${input.pattern || ''}"`
+  if (tool === 'Glob')      return `Glob ${input.pattern || ''}`
+  if (tool === 'Skill')     return `Skill: ${input.skill || '?'}`
+  if (tool === 'WebSearch') return `WebSearch: ${input.query || '?'}`
+  if (tool === 'WebFetch')  return `WebFetch: ${input.url || '?'}`
+  if (tool === 'Agent')     return `Agent: ${input.description || '?'}`
+  return `${tool}`
+}
+
+function tryParseEventData(raw, eventType) {
+  try {
+    const d = typeof raw === 'string' ? JSON.parse(raw) : raw
+
+    if (eventType === 'assistant' || d?.type === 'assistant') {
+      const blocks = d.message?.content || []
+      const parts = []
+      for (const b of blocks) {
+        if (b.type === 'text' && b.text)              parts.push(b.text)
+        else if (b.type === 'tool_use')               parts.push(formatToolUse(b))
+        else if (b.type === 'thinking' && b.thinking) parts.push('(thinking) ' + b.thinking)
+        else if (typeof b === 'string')               parts.push(b)
+      }
+      return parts.join(' ') || null
+    }
+    if (eventType === 'user' || d?.type === 'user') return null
+    if (eventType === 'tool_use' || d?.type === 'tool_use') {
+      const tool = d.tool || d.name || 'unknown'
+      const input = d.input || {}
+      if (tool === 'Bash')      return `$ ${input.command || ''}`
+      if (tool === 'Read')      return `Read ${input.file_path || '?'}`
+      if (tool === 'Edit' || tool === 'Write') return `${tool} ${input.file_path || '?'}`
+      if (tool === 'Grep')      return `Grep "${input.pattern || ''}"`
+      if (tool === 'Glob')      return `Glob ${input.pattern || ''}`
+      if (tool === 'WebSearch') return `WebSearch: ${input.query || '?'}`
+      if (tool === 'WebFetch')  return `WebFetch: ${input.url || '?'}`
+      if (tool === 'Agent')     return `Agent: ${input.description || '?'}`
+      return `${tool}: ${JSON.stringify(input)}`
+    }
+    if (eventType === 'tool_result' || d?.type === 'tool_result') return null
+    if (eventType === 'result' || d?.type === 'result') {
+      const r = d.result
+      if (typeof r === 'string') return r
+      if (r && typeof r === 'object') return JSON.stringify(r)
+      return 'Agent finished'
+    }
+    if (eventType === 'error' || d?.type === 'error') {
+      const err = d.error
+      if (typeof err === 'string') return err
+      if (err && err.message) return err.message
+      return 'Error occurred'
+    }
+    if (eventType === 'system' || d?.type === 'system') {
+      if (d.subtype === 'init') return `Session started in ${d.cwd || '?'}`
+      return d.message || d.text || null
+    }
+    if (eventType === 'rate_limit_event') return 'Rate limit event'
+    return null
+  } catch {
+    return raw || null
+  }
+}
+
+// SQLite stores datetimes as "2026-03-22 23:10:02" (UTC, no timezone suffix).
+function parseUTC(ts) {
+  if (!ts) return null
+  const s = String(ts).trim()
+  if (s.endsWith('Z') || s.includes('+') || /[+-]\d{2}:\d{2}$/.test(s)) return new Date(s)
+  return new Date(s.replace(' ', 'T') + 'Z')
+}
+function fmtDateTime(ts) {
+  if (!ts) return '-'
+  try { return parseUTC(ts).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) } catch { return '-' }
+}
+function fmtDate(ts) {
+  if (!ts) return '-'
+  try { return parseUTC(ts).toLocaleDateString() } catch { return '-' }
+}
+function formatLogTime(ts) {
+  if (!ts) return ''
+  try { return parseUTC(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) } catch { return '' }
+}
+
+// ── StatusBadge ──────────────────────────────────────────────────────────────
 function StatusBadge({ status }) {
-  const color = STATUS_COLORS[status] || '#64748b'
-  const label = STATUS_LABELS[status] || status
+  const color   = STATUS_COLORS[status] || '#64748b'
+  const label   = STATUS_LABELS[status] || status
+  const pulsing = ['reviewing', 'writing', 'planning'].includes(status)
   return (
-    <span style={{
-      display: 'inline-block',
-      padding: '2px 10px',
-      borderRadius: '12px',
-      fontSize: '12px',
-      fontWeight: 600,
-      background: color + '22',
-      color: color,
-      border: `1px solid ${color}44`,
-    }}>
-      {label}
+    <span className="status-badge">
+      <span
+        className={`status-dot${pulsing ? ' is-pulsing' : ''}`}
+        style={{ background: color }}
+      />
+      <span style={{ color }}>{label}</span>
     </span>
   )
 }
 
-function StatCard({ label, value, color }) {
+// ── PipelineFlow ─────────────────────────────────────────────────────────────
+function PipelineFlow({ stats }) {
   return (
-    <div style={{
-      background: '#1e1e3a',
-      borderRadius: '12px',
-      padding: '20px',
-      textAlign: 'center',
-      border: '1px solid #2d2d5e',
-    }}>
-      <div style={{ fontSize: '32px', fontWeight: 700, color: color || '#8b5cf6' }}>{value}</div>
-      <div style={{ fontSize: '13px', color: '#94a3b8', marginTop: '4px' }}>{label}</div>
+    <div className="pipeline">
+      {PIPELINE_STAGES.map((stage, i) => {
+        const count  = stats[stage.key] || 0
+        const active = count > 0
+        return (
+          <React.Fragment key={stage.key}>
+            <div className="pipeline-stage" style={{ opacity: active ? 1 : 0.3 }}>
+              <div
+                className="pipeline-dot"
+                style={{
+                  background: active ? stage.color : '#384458',
+                  animation: stage.pulse && active ? 'pulse 2s ease infinite' : 'none',
+                }}
+              />
+              <span className="pipeline-label">{stage.label}</span>
+              <span className="pipeline-count" style={{ color: active ? stage.color : '#384458' }}>
+                {count}
+              </span>
+            </div>
+            {i < PIPELINE_STAGES.length - 1 && (
+              <span className="pipeline-divider">·</span>
+            )}
+          </React.Fragment>
+        )
+      })}
     </div>
   )
 }
 
+// ── ReviewLogViewer ──────────────────────────────────────────────────────────
+function ReviewLogViewer({ runId, agentType, prNumber, onClose }) {
+  const [allEvents, setAllEvents]         = useState([])
+  const allEventsRef                      = useRef([])
+  const [runStatus, setRunStatus]         = useState('running')
+  const [finishedAt, setFinishedAt]       = useState(null)
+  const [isInitialLoading, setInitialLoading] = useState(true)
+  const cursorRef                         = useRef(0)
+  const containerRef                      = useRef(null)
+  const isRunning                         = runStatus === 'running'
+
+  const fetchLogs = useCallback(async () => {
+    try {
+      const res  = await fetch(`${API}/runs/${runId}/logs?since=${cursorRef.current}`)
+      const data = await res.json()
+      if (data.events?.length > 0) {
+        const existingIds = new Set(allEventsRef.current.map(e => e.id))
+        const newEvents   = data.events.filter(e => !existingIds.has(e.id))
+        if (newEvents.length > 0) {
+          const merged = [...allEventsRef.current, ...newEvents]
+          allEventsRef.current = merged
+          setAllEvents(merged)
+          cursorRef.current = data.events[data.events.length - 1].id
+        }
+      }
+      setRunStatus(data.run_status || 'running')
+      setFinishedAt(data.finished_at)
+    } catch (e) {
+      console.error('Failed to fetch logs:', e)
+    } finally {
+      setInitialLoading(false)
+    }
+  }, [runId])
+
+  useEffect(() => {
+    cursorRef.current = 0
+    allEventsRef.current = []
+    setAllEvents([])
+    setRunStatus('running')
+    setFinishedAt(null)
+    setInitialLoading(true)
+    fetchLogs()
+  }, [runId])
+
+  useEffect(() => {
+    if (!isRunning) return
+    const interval = setInterval(fetchLogs, 2000)
+    return () => clearInterval(interval)
+  }, [fetchLogs, isRunning])
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!isRunning || !el) return
+    const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 50
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [allEvents, isRunning])
+
+  const formattedEvents = allEvents.slice(-500)
+    .map(event => {
+      const summary = tryParseEventData(event.event_data, event.event_type)
+      if (!summary) return null
+      return { ...event, summary }
+    })
+    .filter(Boolean)
+
+  const statusColor = runStatus === 'completed' ? '#2db882'
+    : runStatus === 'error' ? '#e04848'
+    : '#e8a530'
+
+  const titleLabel = prNumber
+    ? `PR #${prNumber}`
+    : agentType === 'discovery'
+      ? 'Discovery'
+      : `Run #${runId}`
+
+  return (
+    <div className="log-panel">
+      <div className="log-panel-header">
+        <div className="log-panel-meta">
+          <span className="log-panel-title">{titleLabel}</span>
+          <span className={`type-tag ${agentType}`}>{agentType}</span>
+          <span className="log-panel-status" style={{ color: statusColor }}>
+            {isRunning ? '● running' : runStatus}
+          </span>
+          <span className="log-panel-count">{formattedEvents.length} events</span>
+        </div>
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>
+          ✕ Close
+        </button>
+      </div>
+
+      <div ref={containerRef} className="log-body">
+        {isInitialLoading ? (
+          <span style={{ color: 'var(--t3)' }}>Loading...</span>
+        ) : formattedEvents.length === 0 ? (
+          <span style={{ color: 'var(--t3)' }}>
+            {isRunning ? 'Waiting for events...' : 'No events recorded.'}
+          </span>
+        ) : (
+          formattedEvents.map(event => (
+            <div key={event.id} className="log-entry">
+              <span className="log-time">{formatLogTime(event.created_at)}</span>
+              {event.phase && event.phase !== 'general' && (
+                <span
+                  className="log-phase"
+                  style={{ color: event.phase === 'editorial' ? '#e07830' : '#28b4b4' }}
+                >
+                  [{event.phase === 'editorial' ? 'editorial' : 'fact_check'}]
+                </span>
+              )}
+              <span
+                className="log-type"
+                style={{ color: EVENT_TYPE_COLOR[event.event_type] || '#384458' }}
+              >
+                {event.event_type}
+              </span>
+              <span>{event.summary}</span>
+            </div>
+          ))
+        )}
+        {isRunning && formattedEvents.length > 0 && (
+          <div className="log-cursor">▋</div>
+        )}
+      </div>
+
+      <div className="log-panel-footer">
+        <span>
+          {isRunning
+            ? 'Polling every 2s...'
+            : finishedAt
+              ? `Finished ${fmtDateTime(finishedAt)}`
+              : `Status: ${runStatus}`}
+        </span>
+        <span>run #{runId}</span>
+      </div>
+    </div>
+  )
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs }) {
+  const activeTopicCount = topics.filter(t => !t.pr_number).length
+  const blogPrCount  = topics.filter(t => t.pr_number).length
+  const runningCount = runs.filter(r => r.status === 'running').length
+
+  const navItems = [
+    { key: 'overview', label: 'Blog Topics', count: activeTopicCount },
+    { key: 'prs',      label: 'Blog PRs',    count: blogPrCount },
+    { key: 'runs',     label: 'Agent Runs',  count: runningCount },
+  ]
+
+  return (
+    <aside className="sidebar">
+      <div className="sidebar-brand">
+        <div className="sidebar-brand-mark">
+          <svg viewBox="0 0 16 16">
+            <path d="M8 1L2 3.5V8c0 3.2 2.4 5.6 6 6.5 3.6-.9 6-3.3 6-6.5V3.5L8 1z" />
+          </svg>
+        </div>
+        <div className="sidebar-brand-text">
+          <h1>Sentinel</h1>
+          <p>Blog Pipeline</p>
+        </div>
+      </div>
+
+      <nav className="sidebar-nav">
+        <div className="nav-label">Views</div>
+        {navItems.map(item => (
+          <button
+            key={item.key}
+            className={`nav-item${activeTab === item.key ? ' active' : ''}`}
+            onClick={() => setActiveTab(item.key)}
+          >
+            <span>{item.label}</span>
+            {item.count > 0 && (
+              <span className="nav-count">{item.count}</span>
+            )}
+          </button>
+        ))}
+      </nav>
+
+      <div className="sidebar-actions">
+        <div className="sidebar-actions-label">Actions</div>
+        <button
+          className="btn btn-amber btn-full"
+          onClick={() => onTrigger('discovery', 'Discovery')}
+        >
+          Run Discovery
+        </button>
+        <button
+          className="btn btn-ghost btn-full"
+          onClick={() => onTrigger('review-poll', 'Review Poll')}
+        >
+          Poll Reviews
+        </button>
+      </div>
+    </aside>
+  )
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
 function App() {
-  const [stats, setStats] = useState({})
-  const [topics, setTopics] = useState([])
-  const [prs, setPrs] = useState([])
-  const [runs, setRuns] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState('overview')
-  const [triggerMsg, setTriggerMsg] = useState('')
+  const [stats, setStats]               = useState({})
+  const [topics, setTopics]             = useState([])
+  const [runs, setRuns]                 = useState([])
+  const [runsTotal, setRunsTotal]       = useState(0)
+  const [runsPage, setRunsPage]         = useState(0)
+  const runsPageRef                     = useRef(0)
+  const [loading, setLoading]           = useState(true)
+  const [activeTab, setActiveTab]       = useState('overview')
+  const [triggerMsg, setTriggerMsg]     = useState('')
+  const [activeReview, setActiveReview] = useState(null)
+
+  const fetchRunsForPage = useCallback(async (page) => {
+    try {
+      const data = await fetch(`${API}/runs?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`).then(r => r.json())
+      setRuns(data.runs || [])
+      setRunsTotal(data.total || 0)
+    } catch (e) {
+      console.error('Failed to fetch runs:', e)
+    }
+  }, [])
 
   const fetchData = useCallback(async () => {
     try {
-      const [statsRes, topicsRes, prsRes, runsRes] = await Promise.all([
+      const [statsRes, topicsRes] = await Promise.all([
         fetch(`${API}/stats`).then(r => r.json()),
         fetch(`${API}/topics?limit=50`).then(r => r.json()),
-        fetch(`${API}/prs`).then(r => r.json()),
-        fetch(`${API}/runs?limit=20`).then(r => r.json()),
       ])
       setStats(statsRes)
       setTopics(topicsRes)
-      setPrs(prsRes)
-      setRuns(runsRes)
+      fetchRunsForPage(runsPageRef.current)
     } catch (e) {
       console.error('Failed to fetch data:', e)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [fetchRunsForPage])
 
   useEffect(() => {
     fetchData()
@@ -96,276 +430,333 @@ function App() {
     return () => clearInterval(interval)
   }, [fetchData])
 
+  // Fetch runs when page changes (skip on initial render since fetchData handles it)
+  const isFirstRender = useRef(true)
+  useEffect(() => {
+    if (isFirstRender.current) { isFirstRender.current = false; return }
+    runsPageRef.current = runsPage
+    fetchRunsForPage(runsPage)
+  }, [runsPage, fetchRunsForPage])
+
   const trigger = async (endpoint, label) => {
     setTriggerMsg(`Starting ${label}...`)
     try {
-      const res = await fetch(`${API}/trigger/${endpoint}`, { method: 'POST' })
+      const res  = await fetch(`${API}/trigger/${endpoint}`, { method: 'POST' })
       const data = await res.json()
       setTriggerMsg(data.message || `${label} triggered`)
       setTimeout(() => setTriggerMsg(''), 5000)
       setTimeout(fetchData, 3000)
+      return data
     } catch (e) {
       setTriggerMsg(`Failed: ${e.message}`)
       setTimeout(() => setTriggerMsg(''), 5000)
+      return null
+    }
+  }
+
+  const triggerReview = async (prNumber) => {
+    const data = await trigger(`review/${prNumber}`, `Review PR #${prNumber}`)
+    if (data?.run_id) {
+      setActiveReview({ pr_number: prNumber, run_id: data.run_id, agent_type: 'reviewer' })
+      setActiveTab('prs')
     }
   }
 
   if (loading) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
-        <div style={{ color: '#8b5cf6', fontSize: '18px' }}>Loading dashboard...</div>
+      <div className="loading-screen">
+        <div className="loading-spinner" />
+        <span>Loading Sentinel...</span>
       </div>
     )
   }
 
+  const GITHUB_REPO = window.__REPO || 'spheron-core/landing-site'
+
+  // Topics without a PR yet - discovered by the agent, waiting to become blogs
+  const discoveryTopics = topics.filter(t => !t.pr_number)
+  // Topics that have a PR number - active in write/review pipeline
+  const blogPrTopics = topics.filter(t => t.pr_number)
+
+  const totalRunPages = Math.ceil(runsTotal / PAGE_SIZE)
+
   return (
-    <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '24px' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px' }}>
-        <div>
-          <h1 style={{ fontSize: '24px', fontWeight: 700, color: '#f1f5f9' }}>Sentinel</h1>
-          <p style={{ fontSize: '14px', color: '#64748b', marginTop: '4px' }}>Automated blog discovery, writing & review</p>
-        </div>
-        <div style={{ display: 'flex', gap: '8px' }}>
-          <button
-            onClick={() => trigger('discovery', 'Discovery')}
-            style={{
-              padding: '8px 16px', borderRadius: '8px', border: '1px solid #8b5cf6',
-              background: '#8b5cf622', color: '#8b5cf6', cursor: 'pointer', fontSize: '13px', fontWeight: 600,
-            }}
-          >
-            Run Discovery
-          </button>
-          <button
-            onClick={() => trigger('review-poll', 'Review Poll')}
-            style={{
-              padding: '8px 16px', borderRadius: '8px', border: '1px solid #06b6d4',
-              background: '#06b6d422', color: '#06b6d4', cursor: 'pointer', fontSize: '13px', fontWeight: 600,
-            }}
-          >
-            Poll Reviews
-          </button>
-        </div>
-      </div>
+    <div className="layout">
+      <Sidebar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        onTrigger={trigger}
+        topics={topics}
+        runs={runs}
+      />
 
-      {triggerMsg && (
-        <div style={{
-          padding: '12px 16px', borderRadius: '8px', background: '#1e3a5f',
-          color: '#7dd3fc', marginBottom: '16px', fontSize: '14px',
-        }}>
-          {triggerMsg}
+      <main className="main">
+        <PipelineFlow stats={stats} />
+
+        {triggerMsg && <div className="toast">{triggerMsg}</div>}
+
+        {/* ── Blog Topics ─────────────────────────────────────────── */}
+        {activeTab === 'overview' && (
+          <>
+            <div className="page-header">
+              <div>
+                <div className="page-title">Blog Topics</div>
+                <div className="page-subtitle">
+                  {discoveryTopics.length} topic{discoveryTopics.length !== 1 ? 's' : ''} pending - discovered, not yet written
+                </div>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <div className="table-outer">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Title</th>
+                      <th>Status</th>
+                      <th>Issue</th>
+                      <th>Created</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {discoveryTopics.length === 0 ? (
+                      <tr>
+                        <td className="empty-cell" colSpan={4}>
+                          <div className="empty-state">
+                            <div className="empty-title">No pending topics</div>
+                            <div className="empty-body">
+                              Click "Run Discovery" to find new blog topics. Topics move to Blog PRs once writing begins.
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : discoveryTopics.map(t => (
+                      <tr key={t.id}>
+                        <td className="col-clamp-wide">{t.title}</td>
+                        <td><StatusBadge status={t.status} /></td>
+                        <td>
+                          {t.issue_number
+                            ? <a className="data-link" href={`https://github.com/${GITHUB_REPO}/issues/${t.issue_number}`} target="_blank" rel="noopener">#{t.issue_number}</a>
+                            : <span className="col-muted">-</span>}
+                        </td>
+                        <td className="col-muted">{fmtDate(t.created_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── Blog PRs ────────────────────────────────────────────── */}
+        {activeTab === 'prs' && (
+          <>
+            <div className="page-header">
+              <div>
+                <div className="page-title">Blog PRs</div>
+                <div className="page-subtitle">
+                  {blogPrTopics.length} PR{blogPrTopics.length !== 1 ? 's' : ''} tracked
+                </div>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <div className="table-outer">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Title</th>
+                      <th>Status</th>
+                      <th>Score</th>
+                      <th>PR</th>
+                      <th>Iter.</th>
+                      <th>Created</th>
+                      <th>Updated</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {blogPrTopics.length === 0 ? (
+                      <tr>
+                        <td className="empty-cell" colSpan={8}>
+                          <div className="empty-state">
+                            <div className="empty-title">No blog PRs yet</div>
+                            <div className="empty-body">
+                              Topics with open PRs will appear here once writing begins.
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : blogPrTopics.map(t => {
+                      const isActive = activeReview?.pr_number === t.pr_number
+                      return (
+                        <tr key={t.id} className={isActive ? 'is-active' : ''}>
+                          <td className="col-clamp-wide">{t.title}</td>
+                          <td><StatusBadge status={t.status} /></td>
+                          <td>
+                            {t.review_score ? (
+                              <span className={`score ${
+                                t.review_score >= 7.5 ? 'score-hi' :
+                                t.review_score >= 5   ? 'score-mid' : 'score-lo'
+                              }`}>
+                                {t.review_score}/10
+                              </span>
+                            ) : <span className="col-muted">-</span>}
+                          </td>
+                          <td>
+                            <a className="data-link" href={`https://github.com/${GITHUB_REPO}/pull/${t.pr_number}`} target="_blank" rel="noopener">
+                              #{t.pr_number}
+                            </a>
+                          </td>
+                          <td className="col-muted">{t.review_iterations || 0}</td>
+                          <td className="col-muted">{fmtDate(t.created_at)}</td>
+                          <td className="col-muted">{fmtDateTime(t.updated_at)}</td>
+                          <td>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                onClick={() => triggerReview(t.pr_number)}
+                                className={`btn btn-review btn-sm${isActive ? ' is-active' : ''}`}
+                              >
+                                {isActive ? '● Reviewing' : 'Review'}
+                              </button>
+                              {isActive && (
+                                <button
+                                  onClick={() => setActiveReview(null)}
+                                  className="btn btn-ghost btn-sm"
+                                >
+                                  Hide
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── Agent Runs ──────────────────────────────────────────── */}
+        {activeTab === 'runs' && (
+          <>
+            <div className="page-header">
+              <div>
+                <div className="page-title">Agent Runs</div>
+                <div className="page-subtitle">{runsTotal} total executions</div>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <div className="table-outer">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Type</th>
+                      <th>Status</th>
+                      <th>PR</th>
+                      <th>Started</th>
+                      <th>Finished</th>
+                      <th>Logs</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {runs.length === 0 ? (
+                      <tr>
+                        <td className="empty-cell" colSpan={7}>
+                          <div className="empty-state">
+                            <div className="empty-title">No agent runs yet</div>
+                            <div className="empty-body">
+                              Discovery and review runs will appear here.
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : runs.map(run => {
+                      const isActive = activeReview?.run_id === run.id
+                      let prNum = null
+                      try { prNum = run.result ? JSON.parse(run.result).pr_number : null } catch {}
+                      const statusClass = run.status === 'completed' ? 'run-completed'
+                        : run.status === 'running' ? 'run-running' : 'run-error'
+                      return (
+                        <tr key={run.id} className={isActive ? 'is-active' : ''}>
+                          <td className="col-muted">#{run.id}</td>
+                          <td>
+                            <span className={`type-tag ${run.agent_type}`}>{run.agent_type}</span>
+                          </td>
+                          <td>
+                            <span className={statusClass}>
+                              {run.status === 'running' ? '● ' : ''}{run.status}
+                            </span>
+                          </td>
+                          <td>
+                            {prNum
+                              ? <a className="data-link" href={`https://github.com/${GITHUB_REPO}/pull/${prNum}`} target="_blank" rel="noopener">#{prNum}</a>
+                              : <span className="col-muted">-</span>}
+                          </td>
+                          <td className="col-muted">{fmtDateTime(run.started_at)}</td>
+                          <td className="col-muted">{fmtDateTime(run.finished_at)}</td>
+                          <td>
+                            <button
+                              onClick={() => setActiveReview(
+                                isActive
+                                  ? null
+                                  : { pr_number: prNum, run_id: run.id, agent_type: run.agent_type }
+                              )}
+                              className={`btn btn-sm${isActive ? ' btn-logs is-active' : ' btn-logs'}`}
+                            >
+                              {isActive ? 'Viewing' : 'View Logs'}
+                            </button>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {totalRunPages > 1 && (
+              <div className="pagination">
+                <span className="pagination-info">
+                  {runsPage * PAGE_SIZE + 1}-{Math.min((runsPage + 1) * PAGE_SIZE, runsTotal)} of {runsTotal}
+                </span>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  disabled={runsPage === 0}
+                  onClick={() => setRunsPage(p => p - 1)}
+                >
+                  Prev
+                </button>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  disabled={runsPage >= totalRunPages - 1}
+                  onClick={() => setRunsPage(p => p + 1)}
+                >
+                  Next
+                </button>
+              </div>
+            )}
+          </>
+        )}
+
+        <div className="app-footer">
+          <span>Sentinel v1.0.0</span>
+          <span>Auto-refreshes every 30s</span>
         </div>
+      </main>
+
+      {activeReview && (
+        <ReviewLogViewer
+          runId={activeReview.run_id}
+          agentType={activeReview.agent_type}
+          prNumber={activeReview.pr_number}
+          onClose={() => setActiveReview(null)}
+        />
       )}
-
-      {/* Stats Grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '12px', marginBottom: '32px' }}>
-        <StatCard label="Total Topics" value={stats.total || 0} color="#8b5cf6" />
-        <StatCard label="Writing" value={stats.writing || 0} color="#6366f1" />
-        <StatCard label="Reviewing" value={stats.reviewing || 0} color="#f97316" />
-        <StatCard label="Ready" value={stats.ready || 0} color="#10b981" />
-        <StatCard label="Completed" value={stats.completed || 0} color="#22c55e" />
-        <StatCard label="Avg Score" value={stats.avg_review_score || '-'} color="#f59e0b" />
-      </div>
-
-      {/* Tabs */}
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', borderBottom: '1px solid #2d2d5e', paddingBottom: '8px' }}>
-        {['overview', 'prs', 'runs'].map(tab => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            style={{
-              padding: '8px 16px', borderRadius: '6px 6px 0 0', border: 'none',
-              background: activeTab === tab ? '#1e1e3a' : 'transparent',
-              color: activeTab === tab ? '#f1f5f9' : '#64748b',
-              cursor: 'pointer', fontSize: '14px', fontWeight: activeTab === tab ? 600 : 400,
-            }}
-          >
-            {tab === 'overview' ? 'Blog Topics' : tab === 'prs' ? 'Open PRs' : 'Agent Runs'}
-          </button>
-        ))}
-      </div>
-
-      {/* Blog Topics Tab */}
-      {activeTab === 'overview' && (
-        <div style={{ background: '#1e1e3a', borderRadius: '12px', overflow: 'hidden', border: '1px solid #2d2d5e' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ background: '#16162e' }}>
-                <th style={thStyle}>Title</th>
-                <th style={thStyle}>Status</th>
-                <th style={thStyle}>Score</th>
-                <th style={thStyle}>Issue</th>
-                <th style={thStyle}>PR</th>
-                <th style={thStyle}>Iterations</th>
-                <th style={thStyle}>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {topics.length === 0 ? (
-                <tr><td colSpan={7} style={{ ...tdStyle, textAlign: 'center', color: '#64748b' }}>
-                  No topics yet. Click "Run Discovery" to find new blog topics.
-                </td></tr>
-              ) : topics.map(t => (
-                <tr key={t.id} style={{ borderBottom: '1px solid #2d2d5e' }}>
-                  <td style={{ ...tdStyle, maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {t.title}
-                  </td>
-                  <td style={tdStyle}><StatusBadge status={t.status} /></td>
-                  <td style={tdStyle}>
-                    {t.review_score ? (
-                      <span style={{ color: t.review_score >= 7.5 ? '#10b981' : t.review_score >= 5 ? '#f59e0b' : '#ef4444' }}>
-                        {t.review_score}/10
-                      </span>
-                    ) : '-'}
-                  </td>
-                  <td style={tdStyle}>
-                    {t.issue_number ? (
-                      <a href={`https://github.com/${window.__REPO || 'spheron-core/landing-site'}/issues/${t.issue_number}`}
-                         target="_blank" rel="noopener" style={{ color: '#3b82f6', textDecoration: 'none' }}>
-                        #{t.issue_number}
-                      </a>
-                    ) : '-'}
-                  </td>
-                  <td style={tdStyle}>
-                    {t.pr_number ? (
-                      <a href={`https://github.com/${window.__REPO || 'spheron-core/landing-site'}/pull/${t.pr_number}`}
-                         target="_blank" rel="noopener" style={{ color: '#3b82f6', textDecoration: 'none' }}>
-                        #{t.pr_number}
-                      </a>
-                    ) : '-'}
-                  </td>
-                  <td style={tdStyle}>{t.review_iterations || 0}</td>
-                  <td style={{ ...tdStyle, color: '#64748b', fontSize: '12px' }}>
-                    {t.created_at ? new Date(t.created_at).toLocaleDateString() : '-'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Open PRs Tab */}
-      {activeTab === 'prs' && (
-        <div style={{ background: '#1e1e3a', borderRadius: '12px', overflow: 'hidden', border: '1px solid #2d2d5e' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ background: '#16162e' }}>
-                <th style={thStyle}>PR</th>
-                <th style={thStyle}>Title</th>
-                <th style={thStyle}>Author</th>
-                <th style={thStyle}>Updated</th>
-                <th style={thStyle}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {prs.length === 0 ? (
-                <tr><td colSpan={5} style={{ ...tdStyle, textAlign: 'center', color: '#64748b' }}>
-                  No open blog PRs found.
-                </td></tr>
-              ) : prs.map(pr => (
-                <tr key={pr.number} style={{ borderBottom: '1px solid #2d2d5e' }}>
-                  <td style={tdStyle}>
-                    <a href={pr.html_url} target="_blank" rel="noopener" style={{ color: '#3b82f6', textDecoration: 'none' }}>
-                      #{pr.number}
-                    </a>
-                  </td>
-                  <td style={{ ...tdStyle, maxWidth: '400px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {pr.title}
-                  </td>
-                  <td style={tdStyle}>{pr.user}</td>
-                  <td style={{ ...tdStyle, color: '#64748b', fontSize: '12px' }}>
-                    {new Date(pr.updated_at).toLocaleString()}
-                  </td>
-                  <td style={tdStyle}>
-                    <button
-                      onClick={() => trigger(`review/${pr.number}`, `Review PR #${pr.number}`)}
-                      style={{
-                        padding: '4px 12px', borderRadius: '6px', border: '1px solid #f97316',
-                        background: '#f9731622', color: '#f97316', cursor: 'pointer', fontSize: '12px',
-                      }}
-                    >
-                      Review
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Agent Runs Tab */}
-      {activeTab === 'runs' && (
-        <div style={{ background: '#1e1e3a', borderRadius: '12px', overflow: 'hidden', border: '1px solid #2d2d5e' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ background: '#16162e' }}>
-                <th style={thStyle}>ID</th>
-                <th style={thStyle}>Type</th>
-                <th style={thStyle}>Status</th>
-                <th style={thStyle}>Started</th>
-                <th style={thStyle}>Finished</th>
-              </tr>
-            </thead>
-            <tbody>
-              {runs.length === 0 ? (
-                <tr><td colSpan={5} style={{ ...tdStyle, textAlign: 'center', color: '#64748b' }}>
-                  No agent runs recorded yet.
-                </td></tr>
-              ) : runs.map(run => (
-                <tr key={run.id} style={{ borderBottom: '1px solid #2d2d5e' }}>
-                  <td style={tdStyle}>{run.id}</td>
-                  <td style={tdStyle}>
-                    <span style={{
-                      padding: '2px 8px', borderRadius: '6px', fontSize: '12px',
-                      background: run.agent_type === 'discovery' ? '#8b5cf622' : '#f9731622',
-                      color: run.agent_type === 'discovery' ? '#8b5cf6' : '#f97316',
-                    }}>
-                      {run.agent_type}
-                    </span>
-                  </td>
-                  <td style={tdStyle}>
-                    <span style={{
-                      color: run.status === 'completed' ? '#10b981' : run.status === 'running' ? '#f59e0b' : '#ef4444'
-                    }}>
-                      {run.status}
-                    </span>
-                  </td>
-                  <td style={{ ...tdStyle, color: '#64748b', fontSize: '12px' }}>
-                    {run.started_at ? new Date(run.started_at).toLocaleString() : '-'}
-                  </td>
-                  <td style={{ ...tdStyle, color: '#64748b', fontSize: '12px' }}>
-                    {run.finished_at ? new Date(run.finished_at).toLocaleString() : '-'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Footer */}
-      <div style={{ marginTop: '32px', textAlign: 'center', color: '#475569', fontSize: '12px' }}>
-        Sentinel v1.0.0 - Auto-refreshes every 30s
-      </div>
     </div>
   )
-}
-
-const thStyle = {
-  padding: '12px 16px',
-  textAlign: 'left',
-  fontSize: '12px',
-  fontWeight: 600,
-  color: '#94a3b8',
-  textTransform: 'uppercase',
-  letterSpacing: '0.05em',
-}
-
-const tdStyle = {
-  padding: '12px 16px',
-  fontSize: '14px',
 }
 
 export default App
