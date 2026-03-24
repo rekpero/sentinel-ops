@@ -10,7 +10,9 @@ Key behaviors:
 import asyncio
 import json
 import logging
+import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -36,7 +38,10 @@ class ReviewAgent:
         self.claude = claude
         self.pricing = pricing
         self.db = db
-        self._tracked_prs: dict[int, str] = {}  # pr_number -> last_seen_commit_sha
+        self._tracked_prs: dict[int, str] = {}     # pr_number -> last_seen_commit_sha
+        self._active_reviews: dict[int, asyncio.Task] = {}  # pr_number -> running review task
+        self._active_run_ids: dict[int, int] = {}            # pr_number -> run_id
+        self._poll_lock = asyncio.Lock()                     # prevents concurrent poll_prs calls
 
     # === Worktree management ===
 
@@ -96,6 +101,50 @@ class ReviewAgent:
                 cwd=str(config.REPO_CLONE_DIR), capture_output=True, timeout=30,
             )
             logger.info(f"PR #{pr_number}: cleaned up worktree at {worktree_path}")
+
+    # === Active review management ===
+
+    async def _cancel_active_review(self, pr_number: int):
+        """
+        Cancel an in-progress review for a PR: kills the Claude subprocess (by process
+        group) and cancels the asyncio task. Marks the DB run as 'cancelled'.
+        Called when a new commit is detected while a review is already running.
+        """
+        run_id = self._active_run_ids.pop(pr_number, None)
+        task = self._active_reviews.pop(pr_number, None)
+
+        # Kill the Claude subprocess using its stored PID.
+        # start_new_session=True makes the child a session/process-group leader,
+        # so pgid == pid and os.killpg(pid, ...) kills the entire group.
+        if run_id is not None:
+            try:
+                pid = await self.db.get_agent_run_pid(run_id)
+                if pid:
+                    try:
+                        os.killpg(pid, signal.SIGTERM)
+                        logger.info(f"PR #{pr_number}: killed Claude subprocess (pid={pid})")
+                    except ProcessLookupError:
+                        pass  # Already exited
+                    except Exception as e:
+                        logger.warning(f"PR #{pr_number}: could not kill pid {pid}: {e}")
+            except Exception as e:
+                logger.warning(f"PR #{pr_number}: could not look up pid for run {run_id}: {e}")
+        # NOTE: finish_agent_run("cancelled") is intentionally NOT called here.
+        # The task's own `except CancelledError` handler calls it, which avoids a
+        # race where the task finishes normally just before cancellation is delivered
+        # and both paths write to the same run record.
+
+        # Cancel the asyncio task and wait for its finally block to complete.
+        # Simply awaiting the cancelled task is the correct pattern: it raises
+        # CancelledError once the coroutine's cleanup (finally) has finished.
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        logger.info(f"PR #{pr_number}: stale review cancelled (run_id={run_id})")
 
     # === Repository helpers ===
 
@@ -539,6 +588,15 @@ class ReviewAgent:
           Phase 2 (concurrent): run up to MAX_CONCURRENT_REVIEWS reviews in parallel using
                                  asyncio.Semaphore so each PR gets its own Claude subprocess.
         """
+        if self._poll_lock.locked():
+            logger.info("Poll already in progress - skipping concurrent poll")
+            return
+
+        async with self._poll_lock:
+            await self._poll_prs_inner()
+
+    async def _poll_prs_inner(self):
+        """Internal poll logic, always called under _poll_lock."""
         logger.info("Polling for blog PRs...")
 
         await self.ensure_repo_cloned()
@@ -615,6 +673,14 @@ class ReviewAgent:
                     f"(sha: {latest_sha[:7]}), queuing review..."
                 )
 
+            # Cancel any in-flight review for this PR - new commit supersedes it.
+            if pr_number in self._active_reviews and not self._active_reviews[pr_number].done():
+                logger.info(
+                    f"PR #{pr_number}: new commit while review running - "
+                    f"cancelling stale review (run_id={self._active_run_ids.get(pr_number)})"
+                )
+                await self._cancel_active_review(pr_number)
+
             # Mark SHA NOW before dispatch so the next scheduled poll (which may fire
             # while this review is still running) does not re-queue the same commit.
             self._tracked_prs[pr_number] = latest_sha
@@ -632,11 +698,11 @@ class ReviewAgent:
 
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def _run_review(pr_number: int, pr_title: str):
+        async def _run_review_tracked(pr_number: int, pr_title: str):
             async with semaphore:
                 run_id = await self.db.create_agent_run("reviewer", None)
-                # Store pr_number immediately so it shows while the run is still running
                 await self.db.set_agent_run_pr(run_id, pr_number)
+                self._active_run_ids[pr_number] = run_id
                 try:
                     is_ready = await self.review_pr(pr_number, run_id=run_id)
                     status = "ready" if is_ready else "needs work"
@@ -645,13 +711,33 @@ class ReviewAgent:
                         run_id, "completed",
                         {"pr_number": pr_number, "ready": is_ready},
                     )
+                except asyncio.CancelledError:
+                    logger.info(f"PR #{pr_number} ({pr_title}): review cancelled (superseded by new commit)")
+                    try:
+                        await self.db.finish_agent_run(run_id, "cancelled", error="Superseded by new commit")
+                    except Exception:
+                        pass
+                    raise
                 except Exception as e:
                     logger.error(
                         f"Review failed for PR #{pr_number} ({pr_title}): {e}", exc_info=True
                     )
                     await self.db.finish_agent_run(run_id, "error", error=str(e))
+                finally:
+                    # Guard against evicting a replacement task's entries if this PR
+                    # was re-queued while this task was being cancelled.
+                    if self._active_reviews.get(pr_number) is asyncio.current_task():
+                        self._active_reviews.pop(pr_number, None)
+                    if self._active_run_ids.get(pr_number) == run_id:
+                        self._active_run_ids.pop(pr_number, None)
 
-        await asyncio.gather(*[_run_review(n, t) for n, t in review_queue])
+        tasks = []
+        for pr_number, pr_title in review_queue:
+            task = asyncio.create_task(_run_review_tracked(pr_number, pr_title))
+            self._active_reviews[pr_number] = task
+            tasks.append(task)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_continuous(self):
         """Run the review agent continuously, polling at configured intervals."""

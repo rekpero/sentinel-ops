@@ -81,7 +81,7 @@ sentinel/
 - The `CLAUDE_SETUP_TOKEN` env var is passed to the subprocess environment.
 - Always specify `--allowedTools` to restrict what tools Claude Code can use for each task type.
 - Discovery agent tools: `WebFetch`, `WebSearch`
-- Review agent tools: `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch`
+- Review agent tools: `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, `Bash` (required for `curl` GitHub API calls and writing the review JSON summary)
 - Timeout is 600 seconds (10 minutes) per Claude Code invocation.
 
 ## Pipeline Flow

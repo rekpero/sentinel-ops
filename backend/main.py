@@ -144,6 +144,8 @@ async def _reattach_and_finish(
                     "completed",
                     {"pr_number": pr_number, "recovered": True, "ready": is_ready},
                 )
+                # Clean up worktree that was created before the restart
+                review_agent.cleanup_pr_worktree(pr_number)
                 return
 
         # Generic finish for non-review runs
@@ -360,18 +362,43 @@ async def trigger_discovery():
 @app.post("/api/trigger/review/{pr_number}")
 async def trigger_review(pr_number: int):
     """Manually trigger review for a specific PR. Returns run_id for live log streaming."""
+    # Cancel any in-flight review for this PR before starting a new one
+    if (
+        review_agent is not None
+        and pr_number in review_agent._active_reviews
+        and not review_agent._active_reviews[pr_number].done()
+    ):
+        await review_agent._cancel_active_review(pr_number)
+
     run_id = await db.create_agent_run("reviewer", None)
+    await db.set_agent_run_pr(run_id, pr_number)
 
     async def _review():
         try:
             await review_agent.ensure_repo_cloned()
             await review_agent.review_pr(pr_number, run_id=run_id)
             await db.finish_agent_run(run_id, "completed", {"pr_number": pr_number})
+        except asyncio.CancelledError:
+            logger.info(f"Manual review PR #{pr_number} cancelled (superseded)")
+            try:
+                await db.finish_agent_run(run_id, "cancelled", error="Superseded by new trigger")
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Manual review failed: {e}")
             await db.finish_agent_run(run_id, "error", error=str(e))
+        finally:
+            # Guard against evicting a replacement task's entries.
+            if review_agent._active_reviews.get(pr_number) is asyncio.current_task():
+                review_agent._active_reviews.pop(pr_number, None)
+            if review_agent._active_run_ids.get(pr_number) == run_id:
+                review_agent._active_run_ids.pop(pr_number, None)
 
-    asyncio.create_task(_review())
+    # Register synchronously before create_task returns so that any concurrent
+    # request sees the task immediately and can cancel it.
+    task = asyncio.create_task(_review())
+    review_agent._active_reviews[pr_number] = task
+    review_agent._active_run_ids[pr_number] = run_id
     return {"message": f"Review started for PR #{pr_number}", "success": True, "run_id": run_id}
 
 

@@ -274,6 +274,13 @@ class Database:
             )
             await db.commit()
 
+    async def get_agent_run_pid(self, run_id: int) -> int | None:
+        """Get the PID of a running agent subprocess."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT pid FROM agent_runs WHERE id = ?", (run_id,))
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
     async def update_agent_run_log_offset(self, run_id: int, offset: int):
         """Persist current log byte offset for restart recovery."""
         async with aiosqlite.connect(self.db_path) as db:

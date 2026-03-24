@@ -311,6 +311,16 @@ class ClaudeService:
                                 logger.warning(f"Failed to update idle log offset: {e}")
                         await asyncio.sleep(0.3)
 
+        except asyncio.CancelledError:
+            # Task was cancelled (e.g. superseded by a new commit). Kill the subprocess
+            # so it doesn't become an orphan posting stale review comments.
+            # pgid == pid because Claude was spawned with start_new_session=True.
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                logger.info(f"Tail cancelled - sent SIGTERM to Claude process group (pid={pid})")
+            except (ProcessLookupError, OSError):
+                pass
+            raise
         except Exception as e:
             logger.error(f"Log tail error (pid={pid}, log={log_path}): {e}")
             return {"success": False, "error": str(e)}
