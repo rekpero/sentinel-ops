@@ -435,14 +435,51 @@ class ReviewAgent:
         # Single Claude session: fact-check + editorial review + post inline comment
         existing_context = await self.get_existing_blogs_context()
 
-        # Fetch authoritative per-GPU pricing BEFORE spawning Claude so we can
-        # pass it directly into the prompt - Claude must not try to fetch pricing itself.
-        try:
-            pricing_context = await self.pricing.format_pricing_for_prompt()
-            logger.info(f"PR #{pr_number}: fetched pricing context ({len(pricing_context)} chars)")
-        except Exception as e:
-            pricing_context = "Pricing data unavailable - skip pricing verification this iteration."
-            logger.warning(f"PR #{pr_number}: could not fetch pricing: {e}")
+        # Pricing is checked ONCE per PR. On subsequent iterations we pass the stored
+        # result so Claude knows what was flagged without hitting the API again.
+        raw_pricing_data: dict = {}
+        existing_pricing_check = await self.db.get_pricing_check_for_pr(pr_number)
+
+        if existing_pricing_check:
+            stored_mismatches = json.loads(existing_pricing_check.get("mismatches", "[]") or "[]")
+            if not isinstance(stored_mismatches, list):
+                stored_mismatches = []
+            stored_pricing_data = json.loads(existing_pricing_check.get("pricing_data", "{}") or "{}")
+            if not isinstance(stored_pricing_data, dict):
+                stored_pricing_data = {}
+
+            # Reconstruct the same pricing table snapshot used on the first iteration so
+            # Claude always checks against the same numbers regardless of live API changes.
+            snapshot_table = self.pricing.format_pricing_from_summary(stored_pricing_data, is_snapshot=True)
+            if stored_mismatches:
+                pricing_context = (
+                    f"NOTE: Pricing was captured once for this PR and must not be re-fetched. "
+                    f"Use ONLY the snapshot below for all pricing verification.\n\n"
+                    f"{snapshot_table}\n\n"
+                    f"Mismatches flagged in the first review iteration: {json.dumps(stored_mismatches)}. "
+                    f"Verify whether the blog has corrected them against the snapshot above."
+                )
+            else:
+                pricing_context = (
+                    f"NOTE: Pricing was captured once for this PR and must not be re-fetched. "
+                    f"Use ONLY the snapshot below for all pricing verification.\n\n"
+                    f"{snapshot_table}\n\n"
+                    f"No pricing mismatches were found in the first review iteration."
+                )
+            logger.info(
+                f"PR #{pr_number}: using stored pricing snapshot (checked_at={existing_pricing_check.get('checked_at')}, "
+                f"{len(stored_mismatches)} prior mismatches)"
+            )
+        else:
+            # First time - fetch live pricing once and format from the same result
+            try:
+                raw_pricing_data = await self.pricing.get_pricing_summary()
+                pricing_context = self.pricing.format_pricing_from_summary(raw_pricing_data)
+                logger.info(f"PR #{pr_number}: fetched live pricing context ({len(pricing_context)} chars)")
+            except Exception as e:
+                raw_pricing_data = {}
+                pricing_context = "Pricing data unavailable - skip pricing verification this iteration."
+                logger.warning(f"PR #{pr_number}: could not fetch pricing: {e}")
 
         # Store recovery context before spawning so a server restart can resume this run
         if run_id:
@@ -478,6 +515,7 @@ class ReviewAgent:
             head_sha=head_sha,
             blog_content=blog_content,
             result=result,
+            raw_pricing_data=raw_pricing_data if not existing_pricing_check else None,
         )
 
     async def _process_review_result(
@@ -488,10 +526,13 @@ class ReviewAgent:
         head_sha: str,
         blog_content: str,
         result: dict,
+        raw_pricing_data: dict = None,
     ) -> bool:
         """
         Process the result from a completed Claude review session.
         Shared between normal flow and post-restart recovery.
+        raw_pricing_data: pass the live-fetched pricing dict on the first iteration so
+        the pricing check can be stored here alongside the parsed review JSON.
         Returns True if the blog is ready to merge.
         """
         if not result.get("success"):
@@ -504,10 +545,12 @@ class ReviewAgent:
             raw = raw.get("result", "") or raw.get("text", "") or json.dumps(raw)
 
         review = {}
+        json_parsed = False
         try:
             json_match = re.search(r'\{[\s\S]*\}', str(raw))
             if json_match:
                 review = json.loads(json_match.group())
+                json_parsed = True
                 logger.info(
                     f"[review] score={review.get('overall_score')}, "
                     f"improvements={len(review.get('improvements', []))}, "
@@ -526,6 +569,23 @@ class ReviewAgent:
         # Pricing mismatches are now flagged by Claude using the pre-fetched pricing table.
         # They appear as entries in improvements/outdated with "pricing" in their text.
         pricing_issues = review.get("pricing_issues") or []
+
+        # Store pricing check on the first iteration, but ONLY when JSON parsed successfully.
+        # If Claude's output was unparseable we skip storage so the next iteration retries
+        # the live pricing fetch rather than recording a false "no mismatches" state.
+        if raw_pricing_data and json_parsed:
+            try:
+                await self.db.create_pricing_check(
+                    topic_id=topic_id,
+                    pr_number=pr_number,
+                    pricing_data=raw_pricing_data,
+                    mismatches=pricing_issues,
+                )
+                logger.info(
+                    f"PR #{pr_number}: stored pricing check ({len(pricing_issues)} mismatches found)"
+                )
+            except Exception as e:
+                logger.warning(f"PR #{pr_number}: could not store pricing check: {e}")
 
         # Broken or mismatched links in the blog are hard blockers
         link_audit = review.get("link_audit") or []

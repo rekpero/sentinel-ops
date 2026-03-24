@@ -115,22 +115,25 @@ class PricingService:
 
         return pricing
 
-    async def format_pricing_for_prompt(self) -> str:
+    def format_pricing_from_summary(self, pricing: dict, is_snapshot: bool = False) -> str:
         """
-        Format per-GPU pricing as a markdown table ready to inject into Claude prompts.
-        Returns a table the agent can use to verify pricing claims in the blog.
+        Format a pre-fetched pricing summary dict as a markdown table for Claude prompts.
+        Use this when you already have the result of get_pricing_summary() to avoid a
+        second API call.
+        is_snapshot=True changes the header to reflect that this is a stored snapshot,
+        not a live fetch - used on review iterations 2+ to avoid contradicting the
+        surrounding pricing_context instruction.
         """
-        try:
-            pricing = await self.get_pricing_summary()
-        except Exception as e:
-            logger.warning(f"Could not fetch pricing for prompt: {e}")
-            return "Pricing data unavailable - skip pricing verification this iteration."
-
         if not pricing:
             return "Pricing data unavailable - skip pricing verification this iteration."
 
+        header = (
+            "Spheron GPU **per-GPU** pricing snapshot ($/hr) captured at first review - use this, do not re-fetch:"
+            if is_snapshot else
+            "Current Spheron GPU **per-GPU** pricing ($/hr) fetched live from the Spheron API:"
+        )
         lines = [
-            "Current Spheron GPU **per-GPU** pricing ($/hr) fetched live from the Spheron API:",
+            header,
             "",
             "| GPU Model | On-Demand $/hr (per GPU) | Spot $/hr (per GPU) |",
             "|-----------|--------------------------|---------------------|",
@@ -150,6 +153,19 @@ class PricingService:
             "Note: prices fluctuate with GPU availability. Always include this disclaimer in the blog.",
         ]
         return "\n".join(lines)
+
+    async def format_pricing_for_prompt(self) -> str:
+        """
+        Format per-GPU pricing as a markdown table ready to inject into Claude prompts.
+        Returns a table the agent can use to verify pricing claims in the blog.
+        """
+        try:
+            pricing = await self.get_pricing_summary()
+        except Exception as e:
+            logger.warning(f"Could not fetch pricing for prompt: {e}")
+            return "Pricing data unavailable - skip pricing verification this iteration."
+
+        return self.format_pricing_from_summary(pricing)
 
     async def format_pricing_for_comment(self) -> str:
         """Format per-GPU pricing for use in PR comments."""

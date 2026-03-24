@@ -235,6 +235,17 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+    async def get_pricing_check_for_pr(self, pr_number: int) -> Optional[dict]:
+        """Return the first pricing check record for this PR, or None if not yet checked."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM pricing_checks WHERE pr_number = ? ORDER BY checked_at ASC LIMIT 1",
+                (pr_number,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     # === Agent Runs ===
 
     async def create_agent_run(self, agent_type: str, topic_id: int = None) -> int:
