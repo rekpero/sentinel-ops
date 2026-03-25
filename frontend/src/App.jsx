@@ -702,12 +702,13 @@ function App() {
                       <th>Status</th>
                       <th>Issue</th>
                       <th>Created</th>
+                      <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {discoveryTopics.length === 0 ? (
                       <tr>
-                        <td className="empty-cell" colSpan={4}>
+                        <td className="empty-cell" colSpan={5}>
                           <div className="empty-state">
                             <div className="empty-title">No pending topics</div>
                             <div className="empty-body">
@@ -726,6 +727,16 @@ function App() {
                             : <span className="col-muted">-</span>}
                         </td>
                         <td className="col-muted">{fmtDate(t.created_at)}</td>
+                        <td>
+                          {['planning_failed', 'planning', 'discovered', 'issue_created'].includes(t.status) && (
+                            <button
+                              className="btn btn-xs"
+                              onClick={() => trigger(`retry-topic/${t.id}`, `Retry "${t.title}"`)}
+                            >
+                              Retry
+                            </button>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

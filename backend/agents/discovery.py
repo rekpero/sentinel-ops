@@ -291,8 +291,10 @@ class DiscoveryAgent:
                 "issue_url": issue_url,
             })
 
-            # Add labels
-            await self.github.add_labels(issue_number, [config.GITHUB_AGENT_LABEL])
+            # Add label only if not already applied (SwarmOps may have added it)
+            existing_labels = await self.github.get_issue_labels(issue_number)
+            if config.GITHUB_AGENT_LABEL not in existing_labels:
+                await self.github.add_labels(issue_number, [config.GITHUB_AGENT_LABEL])
 
             return issue_number
 
@@ -313,6 +315,64 @@ class DiscoveryAgent:
         )
         logger.info(f"Triggered writing agent for issue #{issue_number}")
         await self._emit("trigger", f"Writing agent triggered for issue #{issue_number}")
+
+    async def retry_failed_topic(self, topic: dict):
+        """
+        Retry a topic that failed during discovery.
+        If the issue already exists, just ensure the label is set and trigger writing.
+        If no issue exists, redo the full planning flow.
+        """
+        topic_id = topic["id"]
+        title = topic["title"]
+        issue_number = topic.get("issue_number")
+
+        if issue_number:
+            # Issue was created but label/trigger failed - just resume from there
+            logger.info(f"Retrying topic #{topic_id} '{title}': issue #{issue_number} exists, ensuring label + trigger")
+            existing_labels = await self.github.get_issue_labels(issue_number)
+            if config.GITHUB_AGENT_LABEL not in existing_labels:
+                await self.github.add_labels(issue_number, [config.GITHUB_AGENT_LABEL])
+
+            await self.db.update_topic_status(topic_id, "issue_created", issue_number=issue_number)
+            await self.trigger_writing(issue_number)
+            await self.db.update_topic_status(topic_id, "writing")
+            return True
+
+        # No issue - need to redo planning from scratch
+        logger.info(f"Retrying topic #{topic_id} '{title}': no issue, redoing planning")
+        await self.db.update_topic_status(topic_id, "planning")
+
+        # Reconstruct topic dict for create_plan_and_issue
+        keywords = []
+        try:
+            keywords = json.loads(topic.get("target_keywords", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+        outline = []
+        try:
+            outline = json.loads(topic.get("outline", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        topic_data = {
+            "title": title,
+            "target_keywords": keywords,
+            "outline": outline,
+            "spheron_angle": topic.get("spheron_angle", ""),
+        }
+
+        issue_number = await self.create_plan_and_issue(topic_data)
+        if issue_number:
+            await self.db.update_topic_status(topic_id, "issue_created", issue_number=issue_number)
+            await self.trigger_writing(issue_number)
+            await self.db.update_topic_status(topic_id, "writing")
+            return True
+        else:
+            await self.db.update_topic_status(
+                topic_id, "planning_failed",
+                metadata=json.dumps({"error": "Retry: plan or issue creation failed"}),
+            )
+            return False
 
     async def process_topics(self, topics: list[dict], run_id: int, recovered: bool = False):
         """

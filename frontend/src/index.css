@@ -255,6 +255,7 @@ button { font-family: var(--f-sans); cursor: pointer; }
 .btn-ghost:hover { background: var(--s3); color: var(--t1); }
 
 .btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn-xs { padding: 3px 8px; font-size: 11px; }
 .btn-full { width: 100%; }
 
 .btn-review {

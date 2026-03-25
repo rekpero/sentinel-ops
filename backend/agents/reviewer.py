@@ -539,7 +539,58 @@ class ReviewAgent:
             blog_content=blog_content,
             result=result,
             raw_pricing_data=raw_pricing_data if not existing_pricing_check else None,
+            run_id=run_id,
         )
+
+    def _extract_review_from_log(self, run_id: int | None) -> dict | None:
+        """
+        Scan the Claude log file for a review JSON block with overall_score.
+        Used as a fallback when the final result text doesn't contain the review JSON
+        (e.g. Claude kept talking after outputting the JSON).
+        """
+        if run_id is None:
+            return None
+        from backend import config as _cfg
+        log_path = _cfg.WORKDIR / "runs" / f"{run_id}-review.log"
+        if not log_path.exists():
+            return None
+        try:
+            best = None
+            with open(log_path, "r", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or "overall_score" not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # Look for assistant text messages containing JSON with overall_score
+                    if event.get("type") != "assistant":
+                        continue
+                    content_blocks = (
+                        event.get("message", {}).get("content", [])
+                    )
+                    for block in content_blocks:
+                        if block.get("type") != "text":
+                            continue
+                        text = block.get("text", "")
+                        if "overall_score" not in text:
+                            continue
+                        # Use the same greedy regex as the main parser
+                        m = re.search(r'\{[\s\S]*\}', text)
+                        if not m:
+                            continue
+                        try:
+                            candidate = json.loads(m.group())
+                            if "overall_score" in candidate:
+                                best = candidate
+                        except json.JSONDecodeError:
+                            continue
+            return best
+        except Exception as e:
+            logger.warning(f"[review] Log scan failed: {e}")
+            return None
 
     async def _process_review_result(
         self,
@@ -550,6 +601,7 @@ class ReviewAgent:
         blog_content: str,
         result: dict,
         raw_pricing_data: dict = None,
+        run_id: int = None,
     ) -> bool:
         """
         Process the result from a completed Claude review session.
@@ -573,16 +625,32 @@ class ReviewAgent:
             json_match = re.search(r'\{[\s\S]*\}', str(raw))
             if json_match:
                 review = json.loads(json_match.group())
-                json_parsed = True
-                logger.info(
-                    f"[review] score={review.get('overall_score')}, "
-                    f"improvements={len(review.get('improvements', []))}, "
-                    f"comment_posted={review.get('comment_posted')}"
-                )
-            else:
-                logger.error("[review] No JSON summary found in Claude output")
+                if "overall_score" in review:
+                    json_parsed = True
+                else:
+                    review = {}
+                    logger.warning("[review] JSON found in result text but missing overall_score")
+            if not json_parsed:
+                logger.warning("[review] No valid review JSON in result text, scanning log file...")
+                review = self._extract_review_from_log(run_id) or {}
+                json_parsed = bool(review)
+                if json_parsed:
+                    logger.info(f"[review] Recovered review JSON from log file (score={review.get('overall_score')})")
+                else:
+                    logger.error("[review] No review JSON found in result text or log file")
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[review] Failed to parse result JSON: {e}")
+            review = self._extract_review_from_log(run_id) or {}
+            json_parsed = bool(review)
+            if json_parsed:
+                logger.info(f"[review] Recovered review JSON from log after parse error (score={review.get('overall_score')})")
+
+        if json_parsed:
+            logger.info(
+                f"[review] score={review.get('overall_score')}, "
+                f"improvements={len(review.get('improvements', []))}, "
+                f"comment_posted={review.get('comment_posted')}"
+            )
 
         score = review.get("overall_score", 0)
         improvements = review.get("improvements") or []

@@ -184,6 +184,7 @@ async def _reattach_and_finish(
                     head_sha=head_sha,
                     blog_content=blog_content,
                     result=result,
+                    run_id=run_id,
                 )
                 await db.finish_agent_run(
                     run_id,
@@ -425,6 +426,48 @@ async def trigger_discovery():
     """Manually trigger blog topic discovery."""
     asyncio.create_task(run_discovery())
     return TriggerResponse(message="Discovery started", success=True)
+
+
+@app.post("/api/trigger/retry-topic/{topic_id}")
+async def retry_topic(topic_id: int):
+    """Retry a failed topic - resume from where it left off."""
+    if discovery_agent is None:
+        raise HTTPException(status_code=503, detail="Discovery agent not initialized")
+
+    topic = await db.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    if topic["status"] not in ("planning_failed", "planning", "discovered", "issue_created"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Topic cannot be retried (status: {topic['status']})",
+        )
+
+    if discovery_agent._run_id is not None:
+        raise HTTPException(status_code=409, detail="A discovery run is already in progress")
+
+    run_id = await db.create_agent_run("discovery", topic_id)
+
+    async def _retry():
+        discovery_agent._run_id = run_id
+        try:
+            success = await discovery_agent.retry_failed_topic(topic)
+            logger.info(f"Topic #{topic_id} retry {'succeeded' if success else 'failed'}")
+            await db.finish_agent_run(
+                run_id,
+                "completed" if success else "error",
+                {"topic_id": topic_id, "retried": True},
+                error=None if success else "Retry failed",
+            )
+        except Exception as e:
+            logger.error(f"Topic #{topic_id} retry error: {e}", exc_info=True)
+            await db.finish_agent_run(run_id, "error", error=str(e))
+        finally:
+            discovery_agent._run_id = None
+
+    asyncio.create_task(_retry())
+    return {"message": f"Retrying topic: {topic['title']}", "success": True}
 
 
 @app.post("/api/trigger/review/{pr_number}")

@@ -606,11 +606,15 @@ STRICT LINK VERIFICATION RULES (CRITICAL - violations cause real harm):
 {step4}
 
 ---
-## STEP 5 - RETURN JSON SUMMARY
+## STEP 5 - RETURN JSON SUMMARY (CRITICAL - THIS MUST BE YOUR VERY LAST OUTPUT)
 
-After posting the comment, output a JSON object (and nothing else after it) with this exact structure.
+After posting the comment, output a JSON object with this exact structure.
 For `comment_id`: use the numeric `id` of the NEW inline comment posted in step 4C (PATH A only).
 If PATH B was taken (no inline comment created), set `comment_id` to null.
+
+IMPORTANT: The JSON block below MUST be your FINAL output. Do NOT write any text, commentary,
+or follow-up analysis after the JSON. The system parses your last message to extract this JSON.
+If you output anything after it, the review score will not be recorded and the pipeline will break.
 
 {{
   "overall_score": 7.5,

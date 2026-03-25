@@ -334,6 +334,11 @@ class GitHubService:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_issue_labels(self, issue_number: int) -> list[str]:
+        """Get label names currently on an issue."""
+        issue = await self.get_issue(issue_number)
+        return [label["name"] for label in issue.get("labels", [])]
+
     # === Repository ===
 
     async def get_repo_contents(self, path: str = "", ref: str = ""):
