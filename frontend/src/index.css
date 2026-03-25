@@ -429,6 +429,21 @@ button { font-family: var(--f-sans); cursor: pointer; }
 .run-completed { color: var(--success); font-family: var(--f-mono); font-size: 12px; }
 .run-running   { color: var(--warning); font-family: var(--f-mono); font-size: 12px; }
 .run-error     { color: var(--danger);  font-family: var(--f-mono); font-size: 12px; }
+.run-stopped   { color: #8591a8;        font-family: var(--f-mono); font-size: 12px; }
+
+/* ── Stop / Restart buttons ─────────────────────────────────── */
+.btn-stop {
+  color: var(--danger);
+  border: 1px solid rgba(224, 72, 72, 0.3);
+  background: transparent;
+}
+.btn-stop:hover { background: rgba(224, 72, 72, 0.08); border-color: rgba(224, 72, 72, 0.5); }
+.btn-restart {
+  color: var(--info);
+  border: 1px solid rgba(68, 148, 221, 0.3);
+  background: transparent;
+}
+.btn-restart:hover { background: rgba(68, 148, 221, 0.08); border-color: rgba(68, 148, 221, 0.5); }
 
 /* ── Data link ───────────────────────────────────────────────── */
 .data-link { color: var(--info); }
@@ -479,10 +494,138 @@ button { font-family: var(--f-sans); cursor: pointer; }
   background: var(--s0);
 }
 .log-entry { color: #8591a8; word-break: break-word; }
+.log-entry-pipeline { color: #c5cdd8; }
 .log-time  { color: var(--t3); margin-right: 10px; font-variant-numeric: tabular-nums; user-select: none; }
 .log-phase { margin-right: 8px; font-weight: 600; }
+.log-phase-tag {
+  margin-right: 8px;
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
 .log-type  { margin-right: 8px; font-weight: 600; }
+.log-pipeline-msg { white-space: pre-wrap; }
 .log-cursor { color: var(--t3); padding-top: 4px; animation: pulse 1.2s ease infinite; }
+
+/* Result cards */
+.log-entry-result {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding-top: 8px;
+}
+.log-entry-result .log-time { flex-shrink: 0; padding-top: 2px; }
+
+.result-card {
+  flex: 1;
+  border: 1px solid var(--b1);
+  border-radius: 6px;
+  padding: 12px 14px;
+  background: rgba(255,255,255,0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.result-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.result-card-title {
+  font-weight: 700;
+  color: var(--t1);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.result-card-score {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--f-mono);
+}
+.result-card-scores {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.result-card-score-item {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 11px;
+}
+.result-card-score-label {
+  color: var(--t3);
+}
+.result-card-summary {
+  color: var(--t2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.result-card-clear {
+  color: #2db882;
+  font-size: 12px;
+  font-weight: 600;
+}
+.result-card-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.result-card-issue {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+  color: var(--t2);
+}
+.result-card-severity {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.sev-high    { color: #e04848; background: rgba(224,72,72,0.12); }
+.sev-medium  { color: #e8a530; background: rgba(232,165,48,0.12); }
+.sev-low     { color: var(--t3); background: rgba(133,145,168,0.1); }
+.sev-fact    { color: #4494dd; background: rgba(68,148,221,0.12); }
+.sev-pricing { color: #9b78e4; background: rgba(155,120,228,0.12); }
+
+.result-card-links {
+  font-size: 11px;
+  color: var(--t3);
+}
+
+/* Discovery result card */
+.result-card-topic {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.result-card-topic-num {
+  color: var(--t3);
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.result-card-topic-title {
+  color: var(--t1);
+  font-weight: 600;
+  font-size: 12px;
+}
+.result-card-topic-kw {
+  color: var(--t3);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.result-card-topic-why {
+  color: var(--t2);
+  font-size: 11px;
+  margin-top: 2px;
+}
 
 .log-panel-footer {
   padding: 7px 18px;

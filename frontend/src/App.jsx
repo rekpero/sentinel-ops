@@ -37,6 +37,18 @@ const EVENT_TYPE_COLOR = {
   system:           '#4494dd',
   user:             '#384458',
   rate_limit_event: '#e8a530',
+  pipeline:         '#4494dd',
+}
+
+const PIPELINE_PHASE_CONFIG = {
+  start:    { label: 'START',    color: '#4494dd' },
+  search:   { label: 'SEARCH',   color: '#9b78e4' },
+  topics:   { label: 'TOPICS',   color: '#e8a530' },
+  planning: { label: 'PLANNING', color: '#7b7aff' },
+  issue:    { label: 'ISSUE',    color: '#28b4b4' },
+  trigger:  { label: 'TRIGGER',  color: '#2db882' },
+  done:     { label: 'DONE',     color: '#22c55e' },
+  error:    { label: 'ERROR',    color: '#e04848' },
 }
 
 // Pipeline stages shown in the top flow bar
@@ -96,7 +108,29 @@ function tryParseEventData(raw, eventType) {
     if (eventType === 'tool_result' || d?.type === 'tool_result') return null
     if (eventType === 'result' || d?.type === 'result') {
       const r = d.result
-      if (typeof r === 'string') return r
+      // Try to extract structured review JSON from markdown code block
+      if (typeof r === 'string') {
+        const jsonMatch = r.match(/```json\s*([\s\S]*?)```/)
+        if (jsonMatch) {
+          try {
+            const review = JSON.parse(jsonMatch[1])
+            if (review.overall_score !== undefined) {
+              return { __reviewResult: true, review }
+            }
+          } catch { /* fall through */ }
+        }
+        // Try to extract topic discovery JSON array
+        const arrMatch = r.match(/\[[\s\S]*\]/)
+        if (arrMatch) {
+          try {
+            const topics = JSON.parse(arrMatch[0])
+            if (Array.isArray(topics) && topics[0]?.title) {
+              return { __discoveryResult: true, topics }
+            }
+          } catch { /* fall through */ }
+        }
+        return r
+      }
       if (r && typeof r === 'object') return JSON.stringify(r)
       return 'Agent finished'
     }
@@ -111,10 +145,129 @@ function tryParseEventData(raw, eventType) {
       return d.message || d.text || null
     }
     if (eventType === 'rate_limit_event') return 'Rate limit event'
+    if (eventType === 'pipeline' || d?.type === 'pipeline') {
+      // For topic discovery results with structured data, append topic list
+      if (d.data?.topics && Array.isArray(d.data.topics)) {
+        const topicLines = d.data.topics.map(
+          (t, i) => `  ${i + 1}. ${t.title} [${(t.keywords || []).join(', ')}]`
+        ).join('\n')
+        return `${d.message}\n${topicLines}`
+      }
+      return d.message || 'Pipeline step'
+    }
     return null
   } catch {
     return raw || null
   }
+}
+
+const SCORE_LABEL = {
+  content_quality: 'Content',
+  seo_optimization: 'SEO',
+  technical_accuracy: 'Technical',
+  readability: 'Readability',
+  internal_linking: 'Linking',
+}
+
+function scoreColor(s) {
+  if (s >= 8.5) return '#2db882'
+  if (s >= 7.5) return '#e8a530'
+  return '#e04848'
+}
+
+function ReviewResultCard({ review }) {
+  const score = review.overall_score ?? 0
+  const scores = review.scores || {}
+  const improvements = review.improvements || []
+  const factFlags = review.fact_check_flags || []
+  const pricingIssues = review.pricing_issues || []
+  const links = review.link_audit || []
+  const validLinks = links.filter(l => l.verdict === 'VALID').length
+  const hasIssues = improvements.length > 0 || factFlags.length > 0 || pricingIssues.length > 0
+
+  return (
+    <div className="result-card">
+      <div className="result-card-header">
+        <span className="result-card-title">Review Result</span>
+        <span className="result-card-score" style={{ color: scoreColor(score) }}>
+          {score.toFixed(1)}/10
+        </span>
+      </div>
+
+      <div className="result-card-scores">
+        {Object.entries(scores).map(([k, v]) => (
+          <span key={k} className="result-card-score-item">
+            <span className="result-card-score-label">{SCORE_LABEL[k] || k}</span>
+            <span style={{ color: scoreColor(v) }}>{v}</span>
+          </span>
+        ))}
+      </div>
+
+      {review.summary && (
+        <div className="result-card-summary">{review.summary}</div>
+      )}
+
+      {!hasIssues ? (
+        <div className="result-card-clear">No issues found - blog is ready to merge</div>
+      ) : (
+        <div className="result-card-issues">
+          {improvements.map((imp, i) => (
+            <div key={`imp-${i}`} className="result-card-issue">
+              <span className={`result-card-severity sev-${imp.severity || 'low'}`}>
+                {(imp.severity || 'low').toUpperCase()}
+              </span>
+              <span>{imp.description}</span>
+            </div>
+          ))}
+          {factFlags.map((ff, i) => (
+            <div key={`ff-${i}`} className="result-card-issue">
+              <span className="result-card-severity sev-fact">FACT</span>
+              <span>{ff.claim || ff.concern || ff.description}</span>
+            </div>
+          ))}
+          {pricingIssues.map((pi, i) => (
+            <div key={`pi-${i}`} className="result-card-issue">
+              <span className="result-card-severity sev-pricing">PRICE</span>
+              <span>{pi.description || pi.claim || JSON.stringify(pi)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {links.length > 0 && (
+        <div className="result-card-links">
+          Links verified: {validLinks}/{links.length} valid
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DiscoveryResultCard({ topics }) {
+  return (
+    <div className="result-card">
+      <div className="result-card-header">
+        <span className="result-card-title">Discovery Result</span>
+        <span style={{ color: '#e8a530' }}>{topics.length} topic(s)</span>
+      </div>
+      {topics.map((t, i) => (
+        <div key={i} className="result-card-topic">
+          <span className="result-card-topic-num">{i + 1}.</span>
+          <div>
+            <div className="result-card-topic-title">{t.title}</div>
+            {t.target_keywords?.length > 0 && (
+              <div className="result-card-topic-kw">
+                {t.target_keywords.join(' / ')}
+              </div>
+            )}
+            {t.why_it_ranks && (
+              <div className="result-card-topic-why">{t.why_it_ranks}</div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 // SQLite stores datetimes as "2026-03-22 23:10:02" (UTC, no timezone suffix).
@@ -252,6 +405,7 @@ function ReviewLogViewer({ runId, agentType, prNumber, onClose }) {
 
   const statusColor = runStatus === 'completed' ? '#2db882'
     : runStatus === 'error' ? '#e04848'
+    : runStatus === 'cancelled' || runStatus === 'stopped' ? '#8591a8'
     : '#e8a530'
 
   const titleLabel = prNumber
@@ -284,26 +438,59 @@ function ReviewLogViewer({ runId, agentType, prNumber, onClose }) {
             {isRunning ? 'Waiting for events...' : 'No events recorded.'}
           </span>
         ) : (
-          formattedEvents.map(event => (
-            <div key={event.id} className="log-entry">
-              <span className="log-time">{formatLogTime(event.created_at)}</span>
-              {event.phase && event.phase !== 'general' && (
-                <span
-                  className="log-phase"
-                  style={{ color: event.phase === 'editorial' ? '#e07830' : '#28b4b4' }}
-                >
-                  [{event.phase === 'editorial' ? 'editorial' : 'fact_check'}]
+          formattedEvents.map(event => {
+            const pipelineConf = event.event_type === 'pipeline'
+              ? PIPELINE_PHASE_CONFIG[event.phase] || { label: event.phase?.toUpperCase(), color: '#4494dd' }
+              : null
+            const reviewPhaseColor = event.phase === 'editorial' ? '#e07830'
+              : event.phase === 'fact_check' ? '#28b4b4'
+              : event.phase === 'discovery' ? '#9b78e4'
+              : null
+
+            // Structured result cards
+            if (event.summary?.__reviewResult) {
+              return (
+                <div key={event.id} className="log-entry log-entry-result">
+                  <span className="log-time">{formatLogTime(event.created_at)}</span>
+                  <ReviewResultCard review={event.summary.review} />
+                </div>
+              )
+            }
+            if (event.summary?.__discoveryResult) {
+              return (
+                <div key={event.id} className="log-entry log-entry-result">
+                  <span className="log-time">{formatLogTime(event.created_at)}</span>
+                  <DiscoveryResultCard topics={event.summary.topics} />
+                </div>
+              )
+            }
+
+            return (
+              <div key={event.id} className={`log-entry${pipelineConf ? ' log-entry-pipeline' : ''}`}>
+                <span className="log-time">{formatLogTime(event.created_at)}</span>
+                {pipelineConf ? (
+                  <span className="log-phase-tag" style={{ color: pipelineConf.color }}>
+                    {pipelineConf.label}
+                  </span>
+                ) : event.phase && event.phase !== 'general' && reviewPhaseColor ? (
+                  <span className="log-phase" style={{ color: reviewPhaseColor }}>
+                    [{event.phase}]
+                  </span>
+                ) : null}
+                {!pipelineConf && (
+                  <span
+                    className="log-type"
+                    style={{ color: EVENT_TYPE_COLOR[event.event_type] || '#384458' }}
+                  >
+                    {event.event_type}
+                  </span>
+                )}
+                <span className={pipelineConf ? 'log-pipeline-msg' : ''}>
+                  {typeof event.summary === 'string' ? event.summary : JSON.stringify(event.summary)}
                 </span>
-              )}
-              <span
-                className="log-type"
-                style={{ color: EVENT_TYPE_COLOR[event.event_type] || '#384458' }}
-              >
-                {event.event_type}
-              </span>
-              <span>{event.summary}</span>
-            </div>
-          ))
+              </div>
+            )
+          })
         )}
         {isRunning && formattedEvents.length > 0 && (
           <div className="log-cursor">▋</div>
@@ -658,7 +845,7 @@ function App() {
                       <th>PR</th>
                       <th>Started</th>
                       <th>Finished</th>
-                      <th>Logs</th>
+                      <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -678,7 +865,9 @@ function App() {
                       let prNum = null
                       try { prNum = run.result ? JSON.parse(run.result).pr_number : null } catch {}
                       const statusClass = run.status === 'completed' ? 'run-completed'
-                        : run.status === 'running' ? 'run-running' : 'run-error'
+                        : run.status === 'running' ? 'run-running'
+                        : run.status === 'stopped' || run.status === 'cancelled' ? 'run-stopped'
+                        : 'run-error'
                       return (
                         <tr key={run.id} className={isActive ? 'is-active' : ''}>
                           <td className="col-muted">#{run.id}</td>
@@ -698,16 +887,48 @@ function App() {
                           <td className="col-muted">{fmtDateTime(run.started_at)}</td>
                           <td className="col-muted">{fmtDateTime(run.finished_at)}</td>
                           <td>
-                            <button
-                              onClick={() => setActiveReview(
-                                isActive
-                                  ? null
-                                  : { pr_number: prNum, run_id: run.id, agent_type: run.agent_type }
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                onClick={() => setActiveReview(
+                                  isActive
+                                    ? null
+                                    : { pr_number: prNum, run_id: run.id, agent_type: run.agent_type }
+                                )}
+                                className={`btn btn-sm${isActive ? ' btn-logs is-active' : ' btn-logs'}`}
+                              >
+                                {isActive ? 'Viewing' : 'Logs'}
+                              </button>
+                              {run.status === 'running' && (
+                                <button
+                                  className="btn btn-sm btn-stop"
+                                  onClick={async () => {
+                                    try {
+                                      await fetch(`${API}/runs/${run.id}/stop`, { method: 'POST' })
+                                      fetchData()
+                                    } catch (e) { console.error('Stop failed:', e) }
+                                  }}
+                                >
+                                  Stop
+                                </button>
                               )}
-                              className={`btn btn-sm${isActive ? ' btn-logs is-active' : ' btn-logs'}`}
-                            >
-                              {isActive ? 'Viewing' : 'View Logs'}
-                            </button>
+                              {['completed', 'error', 'stopped', 'cancelled'].includes(run.status) && (
+                                <button
+                                  className="btn btn-sm btn-restart"
+                                  onClick={async () => {
+                                    try {
+                                      const res = await fetch(`${API}/runs/${run.id}/restart`, { method: 'POST' })
+                                      const data = await res.json()
+                                      if (data.run_id) {
+                                        setActiveReview({ pr_number: prNum, run_id: data.run_id, agent_type: run.agent_type })
+                                      }
+                                      setTimeout(fetchData, 2000)
+                                    } catch (e) { console.error('Restart failed:', e) }
+                                  }}
+                                >
+                                  Restart
+                                </button>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       )

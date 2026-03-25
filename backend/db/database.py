@@ -182,6 +182,17 @@ class Database:
             row = await cursor.fetchone()
             return row[0] > 0
 
+    async def get_topic_by_title(self, title: str) -> dict | None:
+        """Get a topic by exact title match (case-insensitive)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM blog_topics WHERE LOWER(title) = ? ORDER BY id DESC LIMIT 1",
+                (title.lower(),),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     async def get_all_topic_titles(self) -> list[str]:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("SELECT title FROM blog_topics")
@@ -257,6 +268,21 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+    async def get_running_reviews_for_pr(self, pr_number: int) -> list[dict]:
+        """Get all running reviewer agent runs for a specific PR."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT * FROM agent_runs
+                   WHERE agent_type = 'reviewer'
+                     AND status = 'running'
+                     AND json_extract(result, '$.pr_number') = ?
+                   ORDER BY id ASC""",
+                (pr_number,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
     async def set_agent_run_pr(self, run_id: int, pr_number: int):
         """Store pr_number in result JSON immediately so it's visible while running."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -266,15 +292,48 @@ class Database:
             )
             await db.commit()
 
-    async def finish_agent_run(self, run_id: int, status: str = "completed",
-                               result: dict = None, error: str = None):
+    async def get_agent_run(self, run_id: int) -> dict | None:
+        """Get a single agent run by ID."""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM agent_runs WHERE id = ?", (run_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def finish_agent_run(self, run_id: int, status: str = "completed",
+                               result: dict = None, error: str = None) -> bool:
+        """Finish an agent run. Merges result with existing result data (preserving
+        pr_number etc. set earlier). Returns True if the run was updated, False if it
+        was already in a terminal state (stopped/cancelled/completed)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Read existing result to merge (preserves pr_number set by set_agent_run_pr)
+            existing = {}
+            cursor = await db.execute(
+                "SELECT result FROM agent_runs WHERE id = ? AND status = 'running'",
+                (run_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                try:
+                    existing = json.loads(row[0])
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except (json.JSONDecodeError, TypeError):
+                    existing = {}
+
+            merged = {**existing, **(result or {})}
+
+            # Only update if still running - prevents race where a stop/cancel
+            # already set a terminal status and a background task overwrites it.
+            cursor = await db.execute(
                 """UPDATE agent_runs SET status = ?, finished_at = datetime('now'),
-                   result = ?, error = ? WHERE id = ?""",
-                (status, json.dumps(result or {}), error, run_id),
+                   result = ?, error = ? WHERE id = ? AND status = 'running'""",
+                (status, json.dumps(merged), error, run_id),
             )
             await db.commit()
+            if cursor.rowcount == 0:
+                logger.info(f"Run #{run_id}: finish_agent_run({status}) skipped - already in terminal state")
+            return cursor.rowcount > 0
 
     async def update_agent_run_process(self, run_id: int, pid: int, log_path: str):
         """Store PID and log path after spawning Claude subprocess."""
@@ -319,6 +378,20 @@ class Database:
             )
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+    async def list_agent_runs(self, limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
+        """List agent runs with pagination. Returns (runs, total_count)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM agent_runs ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+            rows = await cursor.fetchall()
+            count_cursor = await db.execute("SELECT COUNT(*) FROM agent_runs")
+            count_row = await count_cursor.fetchone()
+            total = count_row[0] if count_row else 0
+            return [dict(r) for r in rows], total
 
     # === Agent Run Events (streaming logs) ===
 

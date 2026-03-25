@@ -766,7 +766,7 @@ Provide your review as a JSON object with this structure:
             phase=phase,
         )
 
-    async def discover_topics(self, existing_topics: list[str], focus_areas: str, topic_count: int = 3) -> dict:
+    async def discover_topics(self, existing_topics: list[str], focus_areas: str, topic_count: int = 3, run_id: int = None) -> dict:
         """
         Use Claude Code to discover trending blog topics for SEO.
         """
@@ -806,6 +806,8 @@ Return a JSON array of exactly {topic_count} topics:
         return await self.run_prompt(
             prompt,
             allowed_tools=["WebFetch", "WebSearch"],
+            run_id=run_id,
+            phase="discovery",
         )
 
     async def fact_check_blog(

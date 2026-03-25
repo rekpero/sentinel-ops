@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -47,7 +48,8 @@ async def _recover_running_agents():
     """
     On startup, check all agent runs still marked 'running'.
     - If the Claude subprocess (PID) is still alive: reattach and continue processing.
-    - If the PID is dead: mark as error (next poll will retry the review).
+    - If the PID is dead but recovery context has topics: resume post-Claude pipeline.
+    - Otherwise: mark as error.
     """
     running = await db.get_running_agent_runs()
     if not running:
@@ -60,6 +62,29 @@ async def _recover_running_agents():
         pid = run.get("pid")
         log_path = run.get("log_path")
         log_offset = run.get("log_offset") or 0
+
+        ctx = {}
+        try:
+            ctx = json.loads(run.get("recovery_context", "{}") or "{}")
+        except Exception:
+            pass
+
+        # Discovery runs with saved topics can resume even if Claude is dead.
+        # But first check the Claude subprocess isn't still alive - if it is,
+        # let _reattach_and_finish handle it (it will continue the pipeline after).
+        if ctx.get("type") == "discovery" and ctx.get("topics"):
+            claude_alive = False
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                    claude_alive = True
+                except (OSError, ProcessLookupError):
+                    pass
+            if not claude_alive:
+                logger.info(f"Run {run_id}: discovery with {len(ctx['topics'])} saved topics - resuming pipeline")
+                asyncio.create_task(_resume_discovery(run_id, ctx))
+                continue
+            # Claude still alive - fall through to reattach path
 
         if not pid or not log_path:
             await db.finish_agent_run(
@@ -84,13 +109,34 @@ async def _recover_running_agents():
             continue
 
         logger.info(f"Run {run_id}: PID {pid} still alive - reattaching from offset={log_offset}")
-        ctx = {}
-        try:
-            ctx = json.loads(run.get("recovery_context", "{}") or "{}")
-        except Exception:
-            pass
-
         asyncio.create_task(_reattach_and_finish(run_id, pid, log_path, log_offset, ctx))
+
+
+async def _resume_discovery(run_id: int, ctx: dict):
+    """Resume a discovery run's post-Claude pipeline (planning, issue creation, writing trigger)."""
+    topics = ctx.get("topics", [])
+    logger.info(f"Resuming discovery run {run_id} with {len(topics)} topics")
+
+    discovery_agent._run_id = run_id
+    try:
+        created_count, total = await discovery_agent.process_topics(
+            topics, run_id, recovered=True,
+        )
+        await discovery_agent._emit("done", f"Recovery complete: {created_count}/{total} topics sent to writing", {
+            "topics_found": total,
+            "issues_created": created_count,
+        })
+        await db.finish_agent_run(
+            run_id, "completed",
+            {"topics_found": total, "issues_created": created_count, "recovered": True},
+        )
+        logger.info(f"Discovery recovery complete for run {run_id}: {created_count}/{total}")
+
+    except Exception as e:
+        logger.error(f"Discovery recovery failed for run {run_id}: {e}", exc_info=True)
+        await db.finish_agent_run(run_id, "error", error=f"Recovery error: {e}")
+    finally:
+        discovery_agent._run_id = None
 
 
 async def _reattach_and_finish(
@@ -103,7 +149,7 @@ async def _reattach_and_finish(
             pid=pid,
             log_path=log_path,
             log_offset=log_offset,
-            phase=ctx.get("phase", "review"),
+            phase=ctx.get("phase", "discovery" if ctx.get("type") == "discovery" else "review"),
         )
 
         if ctx.get("type") == "review" and review_agent is not None:
@@ -147,6 +193,28 @@ async def _reattach_and_finish(
                 # Clean up worktree that was created before the restart
                 review_agent.cleanup_pr_worktree(pr_number)
                 return
+
+        # Discovery run: Claude finished, now continue with topic processing
+        if ctx.get("type") == "discovery" and discovery_agent is not None:
+            if result.get("success"):
+                # Parse topics from Claude result and continue pipeline
+                topics = discovery_agent._parse_claude_result(result)
+                if topics:
+                    # Save topics to context so a second restart can also recover
+                    await db.update_agent_run_recovery_context(run_id, {
+                        "type": "discovery",
+                        "topics": topics,
+                    })
+                    await _resume_discovery(run_id, {"topics": topics})
+                    return
+            # Claude failed or no topics
+            await db.finish_agent_run(
+                run_id,
+                "completed" if result.get("success") else "error",
+                {"recovered": True, "topics_found": 0},
+                error=result.get("error") if not result.get("success") else None,
+            )
+            return
 
         # Generic finish for non-review runs
         await db.finish_agent_run(
@@ -372,11 +440,16 @@ async def trigger_review(pr_number: int):
 
     run_id = await db.create_agent_run("reviewer", None)
     await db.set_agent_run_pr(run_id, pr_number)
+    # Cancel any existing running reviews for this PR before starting
+    await review_agent.cancel_running_reviews(pr_number, exclude_run_id=run_id)
 
     async def _review():
         try:
             await review_agent.ensure_repo_cloned()
             await review_agent.review_pr(pr_number, run_id=run_id)
+            await db.insert_run_event(run_id, "general", "pipeline", json.dumps({
+                "type": "pipeline", "message": f"Review completed for PR #{pr_number}",
+            }))
             await db.finish_agent_run(run_id, "completed", {"pr_number": pr_number})
         except asyncio.CancelledError:
             logger.info(f"Manual review PR #{pr_number} cancelled (superseded)")
@@ -386,6 +459,9 @@ async def trigger_review(pr_number: int):
                 pass
         except Exception as e:
             logger.error(f"Manual review failed: {e}")
+            await db.insert_run_event(run_id, "general", "error", json.dumps({
+                "type": "error", "error": str(e),
+            }))
             await db.finish_agent_run(run_id, "error", error=str(e))
         finally:
             # Guard against evicting a replacement task's entries.
@@ -400,6 +476,99 @@ async def trigger_review(pr_number: int):
     review_agent._active_reviews[pr_number] = task
     review_agent._active_run_ids[pr_number] = run_id
     return {"message": f"Review started for PR #{pr_number}", "success": True, "run_id": run_id}
+
+
+@app.post("/api/runs/{run_id}/stop")
+async def stop_agent_run(run_id: int):
+    """Stop a running agent by killing its Claude subprocess and cancelling its asyncio task."""
+    run = await db.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run["status"] != "running":
+        raise HTTPException(status_code=400, detail=f"Run is not running (status: {run['status']})")
+
+    pid = run.get("pid")
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            logger.info(f"Sent SIGTERM to PID {pid} for run #{run_id}")
+        except (OSError, ProcessLookupError):
+            logger.warning(f"PID {pid} for run #{run_id} already dead")
+
+    # Cancel the asyncio task so it stops occupying the semaphore
+    if review_agent is not None:
+        for pr_num, task_run_id in list(review_agent._active_run_ids.items()):
+            if task_run_id == run_id:
+                task = review_agent._active_reviews.get(pr_num)
+                if task and not task.done():
+                    task.cancel()
+                    logger.info(f"Cancelled asyncio task for run #{run_id} (PR #{pr_num})")
+                break
+
+    # Clear discovery agent's _run_id if this was the active discovery run
+    if discovery_agent is not None and discovery_agent._run_id == run_id:
+        discovery_agent._run_id = None
+        logger.info(f"Cleared discovery_agent._run_id for stopped run #{run_id}")
+
+    await db.insert_run_event(run_id, "general", "pipeline", json.dumps({
+        "type": "pipeline", "message": "Agent stopped by user",
+    }))
+    await db.finish_agent_run(run_id, "stopped", error="Stopped by user")
+    return {"message": f"Run #{run_id} stopped", "success": True}
+
+
+@app.post("/api/runs/{run_id}/restart")
+async def restart_agent_run(run_id: int):
+    """Restart a finished/stopped/error agent run."""
+    run = await db.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run["status"] == "running":
+        raise HTTPException(status_code=400, detail="Run is already running")
+
+    agent_type = run["agent_type"]
+    pr_number = None
+    try:
+        result_data = json.loads(run.get("result", "{}") or "{}")
+        pr_number = result_data.get("pr_number")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    if agent_type == "reviewer" and pr_number:
+        data = await trigger_review(pr_number)
+        return {"message": f"Restarted review for PR #{pr_number}", "success": True, "run_id": data.get("run_id")}
+    elif agent_type == "discovery":
+        # Create a new run so the frontend can track it
+        new_run_id = await db.create_agent_run("discovery")
+        async def _restart_discovery():
+            try:
+                discovery_agent._run_id = new_run_id
+                # Save recovery context before Claude subprocess so restart can identify this as discovery
+                await db.update_agent_run_recovery_context(new_run_id, {"type": "discovery"})
+                await discovery_agent._emit("start", "Discovery pipeline restarted")
+                topics = await discovery_agent.discover_topics(run_id=new_run_id)
+                if not topics:
+                    await discovery_agent._emit("done", "No new topics found")
+                    await db.finish_agent_run(new_run_id, "completed", {"topics_found": 0})
+                    return
+                await db.update_agent_run_recovery_context(new_run_id, {
+                    "type": "discovery", "topics": topics,
+                })
+                created_count, total = await discovery_agent.process_topics(topics, new_run_id)
+                await discovery_agent._emit("done", f"Discovery complete: {created_count}/{total} topics sent to writing")
+                await db.finish_agent_run(new_run_id, "completed", {"topics_found": total, "issues_created": created_count})
+            except Exception as e:
+                logger.error(f"Restarted discovery failed: {e}", exc_info=True)
+                await discovery_agent._emit("error", f"Discovery failed: {e}")
+                await db.finish_agent_run(new_run_id, "error", error=str(e))
+            finally:
+                discovery_agent._run_id = None
+        asyncio.create_task(_restart_discovery())
+        return {"message": "Restarted discovery", "success": True, "run_id": new_run_id}
+    else:
+        raise HTTPException(status_code=400, detail=f"Cannot restart {agent_type} run without context")
 
 
 @app.post("/api/trigger/review-poll")
@@ -438,17 +607,8 @@ async def list_open_prs():
 @app.get("/api/runs")
 async def list_agent_runs(limit: int = 20, offset: int = 0):
     """List recent agent runs with pagination."""
-    async with __import__("aiosqlite").connect(str(config.DB_PATH)) as conn:
-        conn.row_factory = __import__("aiosqlite").Row
-        cursor = await conn.execute(
-            "SELECT * FROM agent_runs ORDER BY started_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-        rows = await cursor.fetchall()
-        count_cursor = await conn.execute("SELECT COUNT(*) FROM agent_runs")
-        count_row = await count_cursor.fetchone()
-        total = count_row[0] if count_row else 0
-        return {"runs": [dict(r) for r in rows], "total": total}
+    runs, total = await db.list_agent_runs(limit=limit, offset=offset)
+    return {"runs": runs, "total": total}
 
 
 # --- Agent Run Live Logs ---
@@ -462,13 +622,8 @@ async def get_run_logs(run_id: int, since: int = Query(0)):
     """
     run_events = await db.get_run_events(run_id, since_id=since, limit=200)
     # Also return the run status so the frontend knows when to stop polling
-    async with __import__("aiosqlite").connect(str(config.DB_PATH)) as conn:
-        conn.row_factory = __import__("aiosqlite").Row
-        cursor = await conn.execute(
-            "SELECT status, finished_at FROM agent_runs WHERE id = ?", (run_id,)
-        )
-        row = await cursor.fetchone()
-        run_status = dict(row) if row else {"status": "unknown", "finished_at": None}
+    run = await db.get_agent_run(run_id)
+    run_status = run if run else {"status": "unknown", "finished_at": None}
     return {"events": run_events, "run_status": run_status["status"], "finished_at": run_status["finished_at"]}
 
 

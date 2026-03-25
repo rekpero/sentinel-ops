@@ -339,6 +339,29 @@ class ReviewAgent:
 
     # === Review cycle ===
 
+    async def cancel_running_reviews(self, pr_number: int, exclude_run_id: int = None):
+        """
+        Cancel any running reviewer runs for this PR. Kills the Claude subprocess
+        and marks the run as cancelled. Called before starting a new review to
+        prevent duplicate concurrent reviews of the same PR.
+        """
+        running = await self.db.get_running_reviews_for_pr(pr_number)
+        for run in running:
+            rid = run["id"]
+            if rid == exclude_run_id:
+                continue
+            pid = run.get("pid")
+            logger.info(f"Cancelling running review run #{rid} for PR #{pr_number} (pid={pid})")
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+            await self.db.finish_agent_run(
+                rid, "cancelled",
+                error=f"Superseded by new review for PR #{pr_number}",
+            )
+
     async def review_pr(self, pr_number: int, run_id: int = None) -> bool:
         """
         Full review cycle for a single PR.
@@ -613,9 +636,28 @@ class ReviewAgent:
             score=score,
             review_data={"review": review, "pricing_issues": pricing_issues, "head_sha": head_sha, "link_audit": link_audit, "bad_links": bad_links},
         )
-        await self.db.update_topic_status(topic_id, "reviewing",
-                                          review_score=score,
-                                          review_iterations=iteration)
+
+        # Don't regress from "ready" back to "reviewing" if score is still above threshold
+        # and there are no new issues to report.
+        current_topic = await self.db.get_topic(topic_id)
+        current_status = current_topic.get("status", "") if current_topic else ""
+        if current_status == "ready" and score >= config.MIN_ACCEPTABLE_SCORE and not has_issues:
+            # Keep "ready" status, just update the score and iteration count
+            await self.db.update_topic_status(topic_id, "ready",
+                                              review_score=score,
+                                              review_iterations=iteration)
+            logger.info(f"PR #{pr_number}: kept 'ready' status (score={score}, no new issues)")
+            return True
+        elif current_status == "ready" and has_issues:
+            # Regress from "ready" to "reviewing" because new issues were found
+            await self.db.update_topic_status(topic_id, "reviewing",
+                                              review_score=score,
+                                              review_iterations=iteration)
+            logger.info(f"PR #{pr_number}: regressed from 'ready' to 'reviewing' (score={score}, new issues found)")
+        else:
+            await self.db.update_topic_status(topic_id, "reviewing",
+                                              review_score=score,
+                                              review_iterations=iteration)
 
         if has_issues or score < config.MIN_ACCEPTABLE_SCORE:
             logger.info(f"PR #{pr_number} iteration {iteration}: score={score}/10, needs work")
@@ -706,20 +748,52 @@ class ReviewAgent:
                             f"current sha={latest_sha[:7]})"
                         )
 
-            if latest_sha == last_seen:
-                logger.info(f"PR #{pr_number} ({pr_title}): no new commits, checking if ready...")
+            # Re-evaluate "reviewing" topics that already have a qualifying score.
+            # This catches PRs stuck at "reviewing" after issues were resolved on GitHub
+            # (threads resolved, no new commits needed).
+            topic = await self.db.get_topic_by_pr(pr_number)
+
+            # Never regress a "ready" topic - skip re-review during polling
+            if topic and topic.get("status") == "ready":
+                logger.info(f"PR #{pr_number} ({pr_title}): topic already ready, skipping")
+                self._tracked_prs[pr_number] = latest_sha
+                continue
+
+            # For "reviewing" topics with scores above threshold, re-check readiness
+            # before triggering an expensive review. Covers cases where review threads
+            # were resolved but no new commits arrived to trigger re-evaluation.
+            readiness_already_checked = False
+            if (topic and topic.get("status") == "reviewing"
+                    and (topic.get("review_score") or 0) >= config.MIN_ACCEPTABLE_SCORE):
                 is_ready = await self.check_if_blog_ready(pr_number)
+                readiness_already_checked = True
                 if is_ready:
-                    topic = await self.db.get_topic_by_pr(pr_number)
-                    if topic and topic.get("status") != "ready":
-                        title = topic.get("title", f"PR #{pr_number}")
-                        await self.notify_ready(pr_number, title)
-                        await self.db.update_topic_status(topic["id"], "ready")
-                        logger.info(f"PR #{pr_number} ({pr_title}): marked as ready!")
+                    title = topic.get("title", f"PR #{pr_number}")
+                    await self.notify_ready(pr_number, title)
+                    await self.db.update_topic_status(topic["id"], "ready")
+                    self._tracked_prs[pr_number] = latest_sha
+                    logger.info(f"PR #{pr_number} ({pr_title}): re-evaluated and marked ready (score={topic.get('review_score')})")
+                    continue
+
+            if latest_sha == last_seen:
+                # Skip redundant check if early re-evaluation already called check_if_blog_ready
+                if not readiness_already_checked:
+                    logger.info(f"PR #{pr_number} ({pr_title}): no new commits, checking if ready...")
+                    is_ready = await self.check_if_blog_ready(pr_number)
+                    if is_ready:
+                        if not topic:
+                            topic = await self.db.get_topic_by_pr(pr_number)
+                        if topic and topic.get("status") != "ready":
+                            title = topic.get("title", f"PR #{pr_number}")
+                            await self.notify_ready(pr_number, title)
+                            await self.db.update_topic_status(topic["id"], "ready")
+                            logger.info(f"PR #{pr_number} ({pr_title}): marked as ready!")
+                        else:
+                            logger.info(f"PR #{pr_number} ({pr_title}): already marked ready or no topic")
                     else:
-                        logger.info(f"PR #{pr_number} ({pr_title}): already marked ready or no topic")
+                        logger.info(f"PR #{pr_number} ({pr_title}): not ready yet, waiting for fixes")
                 else:
-                    logger.info(f"PR #{pr_number} ({pr_title}): not ready yet, waiting for fixes")
+                    logger.info(f"PR #{pr_number} ({pr_title}): no new commits, already checked readiness above")
                 continue
 
             if last_seen:
@@ -762,11 +836,16 @@ class ReviewAgent:
             async with semaphore:
                 run_id = await self.db.create_agent_run("reviewer", None)
                 await self.db.set_agent_run_pr(run_id, pr_number)
+                # Cancel any existing running reviews for this PR
+                await self.cancel_running_reviews(pr_number, exclude_run_id=run_id)
                 self._active_run_ids[pr_number] = run_id
                 try:
                     is_ready = await self.review_pr(pr_number, run_id=run_id)
                     status = "ready" if is_ready else "needs work"
                     logger.info(f"PR #{pr_number} ({pr_title}): review complete - {status}")
+                    await self.db.insert_run_event(run_id, "general", "pipeline", json.dumps({
+                        "type": "pipeline", "message": f"Review completed for PR #{pr_number} - {status}",
+                    }))
                     await self.db.finish_agent_run(
                         run_id, "completed",
                         {"pr_number": pr_number, "ready": is_ready},
@@ -782,6 +861,9 @@ class ReviewAgent:
                     logger.error(
                         f"Review failed for PR #{pr_number} ({pr_title}): {e}", exc_info=True
                     )
+                    await self.db.insert_run_event(run_id, "general", "error", json.dumps({
+                        "type": "error", "error": str(e),
+                    }))
                     await self.db.finish_agent_run(run_id, "error", error=str(e))
                 finally:
                     # Guard against evicting a replacement task's entries if this PR
