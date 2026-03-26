@@ -15,6 +15,7 @@ const STATUS_COLORS = {
   ready:           '#2db882',
   completed:       '#22c55e',
   needs_human:     '#e04848',
+  released:        '#38bdf8',
 }
 const STATUS_LABELS = {
   discovered:      'Discovered',
@@ -27,6 +28,7 @@ const STATUS_LABELS = {
   ready:           'Ready',
   completed:       'Completed',
   needs_human:     'Needs Human',
+  released:        'Released',
 }
 const EVENT_TYPE_COLOR = {
   assistant:        '#9b78e4',
@@ -512,7 +514,7 @@ function ReviewLogViewer({ runId, agentType, prNumber, onClose }) {
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
-function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs }) {
+function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs, countdowns }) {
   const activeTopicCount = topics.filter(t => !t.pr_number).length
   const blogPrCount  = topics.filter(t => t.pr_number).length
   const runningCount = runs.filter(r => r.status === 'running').length
@@ -561,12 +563,18 @@ function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs }) {
         >
           Run Discovery
         </button>
+        {countdowns.blog_discovery && (
+          <div className="schedule-hint">Discovery in {countdowns.blog_discovery}</div>
+        )}
         <button
           className="btn btn-ghost btn-full"
           onClick={() => onTrigger('review-poll', 'Review Poll')}
         >
           Poll Reviews
         </button>
+        {countdowns.pr_review && (
+          <div className="schedule-hint">Next poll in {countdowns.pr_review}</div>
+        )}
       </div>
     </aside>
   )
@@ -584,6 +592,9 @@ function App() {
   const [activeTab, setActiveTab]       = useState('overview')
   const [triggerMsg, setTriggerMsg]     = useState('')
   const [activeReview, setActiveReview] = useState(null)
+  const [mergedPrs, setMergedPrs]       = useState(new Set())
+  const [schedule, setSchedule]         = useState({})
+  const [countdowns, setCountdowns]     = useState({})
 
   const fetchRunsForPage = useCallback(async (page) => {
     try {
@@ -597,12 +608,16 @@ function App() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [statsRes, topicsRes] = await Promise.all([
+      const [statsRes, topicsRes, mergedRes, scheduleRes] = await Promise.all([
         fetch(`${API}/stats`).then(r => r.json()),
         fetch(`${API}/topics?limit=50`).then(r => r.json()),
+        fetch(`${API}/prs/merged`).then(r => r.json()).catch(() => ({ merged: [] })),
+        fetch(`${API}/schedule`).then(r => r.json()).catch(() => ({})),
       ])
       setStats(statsRes)
       setTopics(topicsRes)
+      setMergedPrs(new Set(mergedRes.merged || []))
+      setSchedule(scheduleRes)
       fetchRunsForPage(runsPageRef.current)
     } catch (e) {
       console.error('Failed to fetch data:', e)
@@ -616,6 +631,26 @@ function App() {
     const interval = setInterval(fetchData, 30000)
     return () => clearInterval(interval)
   }, [fetchData])
+
+  // Update countdowns every second
+  useEffect(() => {
+    const tick = () => {
+      const now = Date.now()
+      const result = {}
+      for (const [jobId, iso] of Object.entries(schedule)) {
+        const diff = new Date(iso).getTime() - now
+        if (diff <= 0) { result[jobId] = 'any moment'; continue }
+        const h = Math.floor(diff / 3600000)
+        const m = Math.floor((diff % 3600000) / 60000)
+        const s = Math.floor((diff % 60000) / 1000)
+        result[jobId] = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`
+      }
+      setCountdowns(result)
+    }
+    tick()
+    const iv = setInterval(tick, 1000)
+    return () => clearInterval(iv)
+  }, [schedule])
 
   // Fetch runs when page changes (skip on initial render since fetchData handles it)
   const isFirstRender = useRef(true)
@@ -675,6 +710,7 @@ function App() {
         onTrigger={trigger}
         topics={topics}
         runs={runs}
+        countdowns={countdowns}
       />
 
       <main className="main">
@@ -786,10 +822,12 @@ function App() {
                       </tr>
                     ) : blogPrTopics.map(t => {
                       const isActive = activeReview?.pr_number === t.pr_number
+                      const isMerged = mergedPrs.has(t.pr_number)
+                      const displayStatus = isMerged ? 'released' : t.status
                       return (
                         <tr key={t.id} className={isActive ? 'is-active' : ''}>
                           <td className="col-clamp-wide">{t.title}</td>
-                          <td><StatusBadge status={t.status} /></td>
+                          <td><StatusBadge status={displayStatus} /></td>
                           <td>
                             {t.review_score ? (
                               <span className={`score ${
@@ -809,22 +847,26 @@ function App() {
                           <td className="col-muted">{fmtDate(t.created_at)}</td>
                           <td className="col-muted">{fmtDateTime(t.updated_at)}</td>
                           <td>
-                            <div style={{ display: 'flex', gap: 6 }}>
-                              <button
-                                onClick={() => triggerReview(t.pr_number)}
-                                className={`btn btn-review btn-sm${isActive ? ' is-active' : ''}`}
-                              >
-                                {isActive ? '● Reviewing' : 'Review'}
-                              </button>
-                              {isActive && (
+                            {isMerged ? (
+                              <span className="col-muted" style={{ fontSize: 12 }}>-</span>
+                            ) : (
+                              <div style={{ display: 'flex', gap: 6 }}>
                                 <button
-                                  onClick={() => setActiveReview(null)}
-                                  className="btn btn-ghost btn-sm"
+                                  onClick={() => triggerReview(t.pr_number)}
+                                  className={`btn btn-review btn-sm${isActive ? ' is-active' : ''}`}
                                 >
-                                  Hide
+                                  {isActive ? '● Reviewing' : 'Review'}
                                 </button>
-                              )}
-                            </div>
+                                {isActive && (
+                                  <button
+                                    onClick={() => setActiveReview(null)}
+                                    className="btn btn-ghost btn-sm"
+                                  >
+                                    Hide
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           </td>
                         </tr>
                       )

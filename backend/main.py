@@ -338,6 +338,17 @@ async def health():
     return {"status": "ok", "repo": config.GITHUB_REPO}
 
 
+@app.get("/api/schedule")
+async def get_schedule():
+    """Return next run times for scheduled jobs."""
+    from backend.scheduler.cron import scheduler as _scheduler
+    result = {}
+    for job in _scheduler.get_jobs():
+        if job.next_run_time:
+            result[job.id] = job.next_run_time.isoformat()
+    return result
+
+
 # --- Dashboard Stats ---
 
 @app.get("/api/stats")
@@ -641,6 +652,24 @@ async def list_open_prs():
             }
             for pr in prs
         ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/prs/merged")
+async def list_merged_prs():
+    """Return PR numbers that have been merged (closed PRs with merged_at set)."""
+    try:
+        closed_prs = await github.list_prs(
+            state="closed", labels=config.GITHUB_BLOG_LABEL, per_page=100
+        )
+        # The Issues API includes pull_request.merged_at - no extra API calls needed
+        merged_numbers = [
+            pr.get("number")
+            for pr in closed_prs
+            if pr.get("pull_request", {}).get("merged_at")
+        ]
+        return {"merged": merged_numbers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
