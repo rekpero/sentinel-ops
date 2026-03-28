@@ -14,6 +14,8 @@ import json
 import logging
 import re
 import subprocess
+
+import httpx
 from pathlib import Path
 from typing import Optional
 
@@ -292,9 +294,20 @@ class DiscoveryAgent:
             })
 
             # Add label only if not already applied (SwarmOps may have added it)
-            existing_labels = await self.github.get_issue_labels(issue_number)
-            if config.GITHUB_AGENT_LABEL not in existing_labels:
-                await self.github.add_labels(issue_number, [config.GITHUB_AGENT_LABEL])
+            # Retry with backoff - GitHub may 404 briefly after issue creation
+            for attempt in range(5):
+                try:
+                    existing_labels = await self.github.get_issue_labels(issue_number)
+                    if config.GITHUB_AGENT_LABEL not in existing_labels:
+                        await self.github.add_labels(issue_number, [config.GITHUB_AGENT_LABEL])
+                    break
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404 and attempt < 4:
+                        wait = 2 ** attempt  # 1, 2, 4, 8s
+                        logger.warning(f"Issue #{issue_number} not found yet (attempt {attempt + 1}/5), retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
 
             return issue_number
 
