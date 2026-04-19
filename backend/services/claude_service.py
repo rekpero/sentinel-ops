@@ -770,26 +770,111 @@ Provide your review as a JSON object with this structure:
             phase=phase,
         )
 
-    async def discover_topics(self, existing_topics: list[str], focus_areas: str, topic_count: int = 3, run_id: int = None) -> dict:
+    async def discover_topics(
+        self,
+        existing_topics: list[str],
+        focus_areas: str,
+        topic_count: int = 3,
+        run_id: int = None,
+        user_suggestions: list[dict] = None,
+        existing_slugs: list[str] = None,
+    ) -> dict:
         """
         Use Claude Code to discover trending blog topics for SEO.
+
+        user_suggestions: optional list of {id, title, keywords, notes} the user wants
+        Claude to evaluate. Each must be checked against existing content and returned
+        with a decision in the suggestion_decisions block.
+
+        existing_slugs: complete list of published blog slugs fetched server-side from
+        spheron.network/blog/. Injected directly into the prompt so Claude has the full
+        catalog without relying on a summarized WebFetch of the index.
         """
         existing_str = "\n".join(f"- {t}" for t in existing_topics)
+
+        slug_block = ""
+        if existing_slugs:
+            slug_lines = "\n".join(f"- {s}" for s in existing_slugs)
+            slug_block = f"""
+PUBLISHED BLOG SLUGS ({len(existing_slugs)} posts, full catalog from spheron.network/blog/):
+{slug_lines}
+
+This is the COMPLETE list of published posts. Do NOT WebFetch spheron.network/blog/ to enumerate posts - the full catalog is above. Only WebFetch an individual post URL (e.g. https://www.spheron.network/blog/<slug>/) when you need to read its actual content to judge cannibalization.
+"""
+
+        suggestions_block = ""
+        suggestion_instructions = ""
+        decisions_schema = ""
+        if user_suggestions:
+            lines = []
+            for s in user_suggestions:
+                kws = s.get("keywords") or []
+                if isinstance(kws, str):
+                    try:
+                        kws = json.loads(kws)
+                    except (json.JSONDecodeError, TypeError):
+                        kws = []
+                kw_str = ", ".join(kws) if kws else "(no keywords)"
+                notes = s.get("notes") or ""
+                notes_str = f" | notes: {notes}" if notes else ""
+                lines.append(f"- [id={s['id']}] {s.get('title', '')} | keywords: {kw_str}{notes_str}")
+            suggestions_block = f"""
+USER SUGGESTIONS (operator-provided ideas to prioritize):
+{chr(10).join(lines)}
+"""
+            catalog_ref = (
+                "Scan the PUBLISHED BLOG SLUGS list for any slug whose keywords overlap the suggestion. That list is the complete, authoritative catalog."
+                if existing_slugs
+                else "Compare the suggestion against EXISTING BLOG TOPICS above by keyword and intent (not just title match)."
+            )
+            suggestion_instructions = f"""
+HANDLING USER SUGGESTIONS (CRITICAL):
+For each suggestion above, you MUST:
+1. {catalog_ref}
+2. If there is a likely overlap, WebFetch that specific post (https://www.spheron.network/blog/<slug>/) to read its content and judge real cannibalization risk. Do NOT WebFetch the blog index.
+3. Also compare against EXISTING BLOG TOPICS listed above (keywords and intent, not just title).
+4. Decide one of:
+   - "use": topic is not yet covered. Include it as one of your returned topics and prioritize it ahead of purely trend-driven picks.
+   - "angle": topic is partially covered but there is a distinct, non-cannibalizing angle (deeper sub-topic, different search intent, updated data, a specific comparison, a long-tail keyword). Include it as a returned topic with the new angle in the title and outline.
+   - "skip": topic is already well-covered and a new post would cannibalize ranking equity. Do NOT include it as a returned topic.
+5. Returned topics from user suggestions still count toward the {topic_count} topic total. Fill remaining slots with discovered trending topics.
+"""
+            decisions_schema = """
+
+Also return a JSON object `suggestion_decisions` covering EVERY user suggestion by id:
+{
+  "suggestion_decisions": [
+    {
+      "id": <suggestion id>,
+      "decision": "use|angle|skip",
+      "reason": "Short explanation (include URLs of existing posts if skipping/angle)",
+      "produced_topic_title": "Title of the topic you added for this suggestion, or null if skipped"
+    }
+  ]
+}
+Output the topics array FIRST, then the suggestion_decisions object. Both must be valid JSON.
+"""
+
         prompt = f"""You are an expert SEO content strategist for Spheron, a GPU cloud infrastructure company.
 Your job is to find {topic_count} blog topics that will rank well in search and drive GPU cloud users to Spheron.
 
 FOCUS AREAS:
 {focus_areas}
 
-EXISTING BLOG TOPICS (avoid duplicates):
+EXISTING BLOG TOPICS (avoid duplicates AND keyword cannibalization):
 {existing_str}
-
+{slug_block}{suggestions_block}
 RESEARCH INSTRUCTIONS:
 1. Search for trending topics in AI/ML infrastructure, GPU cloud, LLM deployment
 2. Look at competitor blogs (RunPod, Vast.ai, Lambda Labs, CoreWeave) for gaps we can fill
 3. Check Google Trends and recent AI news for timely topics
 4. Find high-volume keywords with reasonable competition
 5. Prioritize topics where Spheron's GPU cloud can be positioned as the solution
+{suggestion_instructions}
+CANNIBALIZATION CHECK (applies to every returned topic, not just suggestions):
+- Do NOT propose a topic whose primary keyword is already the primary keyword of an existing blog.
+- If a topic overlaps with existing content, shift to a distinct long-tail keyword or sub-intent so it captures NEW search demand instead of splitting equity with the existing post.
+- Every returned topic MUST include a `cannibalization_check` field explaining why it will not cannibalize any existing post (name the closest existing post and the search-intent difference).
 
 IMPORTANT: Never use emdashes (--) in any content. Use hyphens (-) instead.
 
@@ -803,10 +888,12 @@ Return a JSON array of exactly {topic_count} topics:
     "why_it_ranks": "Brief explanation of why this topic will rank well",
     "outline": ["Section 1", "Section 2", "Section 3"],
     "spheron_angle": "How to position Spheron in this content",
-    "timeliness": "Why publish this now"
+    "timeliness": "Why publish this now",
+    "cannibalization_check": "Closest existing post + why this new post targets a different search intent",
+    "source_suggestion_id": <id of user suggestion this was produced from, or null>
   }}
 ]
-"""
+{decisions_schema}"""
         return await self.run_prompt(
             prompt,
             allowed_tools=["WebFetch", "WebSearch"],

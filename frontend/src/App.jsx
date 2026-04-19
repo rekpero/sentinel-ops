@@ -514,15 +514,16 @@ function ReviewLogViewer({ runId, agentType, prNumber, onClose }) {
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
-function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs, countdowns }) {
+function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs, countdowns, suggestionCount }) {
   const activeTopicCount = topics.filter(t => !t.pr_number).length
   const blogPrCount  = topics.filter(t => t.pr_number).length
   const runningCount = runs.filter(r => r.status === 'running').length
 
   const navItems = [
-    { key: 'overview', label: 'Blog Topics', count: activeTopicCount },
-    { key: 'prs',      label: 'Blog PRs',    count: blogPrCount },
-    { key: 'runs',     label: 'Agent Runs',  count: runningCount },
+    { key: 'overview',    label: 'Blog Topics',  count: activeTopicCount },
+    { key: 'prs',         label: 'Blog PRs',     count: blogPrCount },
+    { key: 'suggestions', label: 'Suggestions',  count: suggestionCount },
+    { key: 'runs',        label: 'Agent Runs',   count: runningCount },
   ]
 
   return (
@@ -580,6 +581,134 @@ function Sidebar({ activeTab, setActiveTab, onTrigger, topics, runs, countdowns 
   )
 }
 
+// ── Suggestions Panel ─────────────────────────────────────────────────────────
+function SuggestionsPanel({ suggestions, onCreate, onDelete, onReset }) {
+  const [title, setTitle] = useState('')
+  const [keywords, setKeywords] = useState('')
+  const [notes, setNotes] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const handleSubmit = async (e) => {
+    e.preventDefault()
+    if (!title.trim() || submitting) return
+    setSubmitting(true)
+    const kws = keywords.split(',').map(k => k.trim()).filter(Boolean)
+    const ok = await onCreate({ title: title.trim(), keywords: kws, notes: notes.trim() })
+    if (ok) {
+      setTitle('')
+      setKeywords('')
+      setNotes('')
+    }
+    setSubmitting(false)
+  }
+
+  const pending = suggestions.filter(s => s.status === 'pending')
+  const processed = suggestions.filter(s => s.status !== 'pending')
+
+  return (
+    <>
+      <div className="page-header">
+        <div>
+          <div className="page-title">Discovery Suggestions</div>
+          <div className="page-subtitle">
+            Ideas fed to the next discovery run. Discovery checks each against existing blogs and either uses them, finds a fresh angle, or skips to avoid cannibalization.
+          </div>
+        </div>
+      </div>
+
+      <div className="table-wrap">
+        <form className="suggestion-form" onSubmit={handleSubmit}>
+          <input
+            className="field-input"
+            placeholder="Topic title or idea"
+            value={title}
+            onChange={e => setTitle(e.target.value)}
+            required
+          />
+          <input
+            className="field-input"
+            placeholder="keywords (comma separated)"
+            value={keywords}
+            onChange={e => setKeywords(e.target.value)}
+          />
+          <textarea
+            className="field-textarea"
+            placeholder="Optional notes (angle, constraints, references)"
+            value={notes}
+            onChange={e => setNotes(e.target.value)}
+            rows={1}
+          />
+          <button type="submit" className="btn btn-amber btn-sm" disabled={submitting || !title.trim()}>
+            {submitting ? 'Adding...' : 'Add'}
+          </button>
+        </form>
+
+        <div className="table-outer">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Suggestion</th>
+                <th>Status</th>
+                <th>Added</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {suggestions.length === 0 ? (
+                <tr>
+                  <td className="empty-cell" colSpan={4}>
+                    <div className="empty-state">
+                      <div className="empty-title">No suggestions yet</div>
+                      <div className="empty-body">
+                        Add topic ideas above. Discovery will evaluate them on the next run - if a close post already exists it will skip or propose a non-cannibalizing angle.
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              ) : [...pending, ...processed].map(s => (
+                <tr key={s.id}>
+                  <td>
+                    <div style={{ color: 'var(--t1)', fontSize: 13 }}>{s.title}</div>
+                    {s.keywords?.length > 0 && (
+                      <div className="suggestion-kw" style={{ marginTop: 2 }}>
+                        {s.keywords.join(' / ')}
+                      </div>
+                    )}
+                    {s.notes && (
+                      <div style={{ color: 'var(--t2)', fontSize: 12, marginTop: 4 }}>
+                        {s.notes}
+                      </div>
+                    )}
+                    {s.reason && (
+                      <div className="suggestion-reason">{s.reason}</div>
+                    )}
+                  </td>
+                  <td>
+                    <span className={`suggestion-status ${s.status}`}>{s.status.toUpperCase()}</span>
+                  </td>
+                  <td className="col-muted">{fmtDate(s.created_at)}</td>
+                  <td>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {s.status !== 'pending' && (
+                        <button className="btn btn-xs btn-ghost" onClick={() => onReset(s.id)}>
+                          Retry
+                        </button>
+                      )}
+                      <button className="btn btn-xs btn-stop" onClick={() => onDelete(s.id)}>
+                        Delete
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  )
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 function App() {
   const [stats, setStats]               = useState({})
@@ -595,6 +724,7 @@ function App() {
   const [mergedPrs, setMergedPrs]       = useState(new Set())
   const [schedule, setSchedule]         = useState({})
   const [countdowns, setCountdowns]     = useState({})
+  const [suggestions, setSuggestions]   = useState([])
 
   const fetchRunsForPage = useCallback(async (page) => {
     try {
@@ -608,16 +738,18 @@ function App() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [statsRes, topicsRes, mergedRes, scheduleRes] = await Promise.all([
+      const [statsRes, topicsRes, mergedRes, scheduleRes, suggestionsRes] = await Promise.all([
         fetch(`${API}/stats`).then(r => r.json()),
         fetch(`${API}/topics?limit=50`).then(r => r.json()),
         fetch(`${API}/prs/merged`).then(r => r.json()).catch(() => ({ merged: [] })),
         fetch(`${API}/schedule`).then(r => r.json()).catch(() => ({})),
+        fetch(`${API}/suggestions`).then(r => r.json()).catch(() => []),
       ])
       setStats(statsRes)
       setTopics(topicsRes)
       setMergedPrs(new Set(mergedRes.merged || []))
       setSchedule(scheduleRes)
+      setSuggestions(Array.isArray(suggestionsRes) ? suggestionsRes : [])
       fetchRunsForPage(runsPageRef.current)
     } catch (e) {
       console.error('Failed to fetch data:', e)
@@ -676,6 +808,49 @@ function App() {
     }
   }
 
+  const fetchSuggestions = useCallback(async () => {
+    try {
+      const data = await fetch(`${API}/suggestions`).then(r => r.json())
+      setSuggestions(Array.isArray(data) ? data : [])
+    } catch (e) {
+      console.error('Failed to fetch suggestions:', e)
+    }
+  }, [])
+
+  const createSuggestion = useCallback(async (payload) => {
+    try {
+      const res = await fetch(`${API}/suggestions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!res.ok) return false
+      await fetchSuggestions()
+      return true
+    } catch (e) {
+      console.error('Create suggestion failed:', e)
+      return false
+    }
+  }, [fetchSuggestions])
+
+  const deleteSuggestion = useCallback(async (id) => {
+    try {
+      await fetch(`${API}/suggestions/${id}`, { method: 'DELETE' })
+      await fetchSuggestions()
+    } catch (e) { console.error('Delete suggestion failed:', e) }
+  }, [fetchSuggestions])
+
+  const resetSuggestion = useCallback(async (id) => {
+    try {
+      await fetch(`${API}/suggestions/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'pending' }),
+      })
+      await fetchSuggestions()
+    } catch (e) { console.error('Reset suggestion failed:', e) }
+  }, [fetchSuggestions])
+
   const triggerReview = async (prNumber) => {
     const data = await trigger(`review/${prNumber}`, `Review PR #${prNumber}`)
     if (data?.run_id) {
@@ -711,6 +886,7 @@ function App() {
         topics={topics}
         runs={runs}
         countdowns={countdowns}
+        suggestionCount={suggestions.filter(s => s.status === 'pending').length}
       />
 
       <main className="main">
@@ -876,6 +1052,16 @@ function App() {
               </div>
             </div>
           </>
+        )}
+
+        {/* ── Discovery Suggestions ───────────────────────────────── */}
+        {activeTab === 'suggestions' && (
+          <SuggestionsPanel
+            suggestions={suggestions}
+            onCreate={createSuggestion}
+            onDelete={deleteSuggestion}
+            onReset={resetSuggestion}
+          />
         )}
 
         {/* ── Agent Runs ──────────────────────────────────────────── */}

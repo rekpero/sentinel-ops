@@ -108,6 +108,26 @@ class DiscoveryAgent:
 
         return titles
 
+    async def get_live_blog_slugs(self) -> list[str]:
+        """Fetch every published blog slug from the live Spheron blog index.
+
+        The index is statically rendered (Next.js SSG), so one HTTP request yields the
+        complete catalog. This is more reliable than a WebFetch inside the Claude
+        prompt, which passes through a summarizer model and truncates the list.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(config.SPHERON_BLOG_URL)
+                resp.raise_for_status()
+            slugs = set(re.findall(r'/blog/([a-z0-9][a-z0-9-]*)/', resp.text))
+            # Filter out non-post slugs that might share the /blog/ prefix
+            blacklist = {"page", "tag", "category", "author"}
+            slugs = [s for s in slugs if s not in blacklist]
+            return sorted(slugs)
+        except Exception as e:
+            logger.warning(f"Failed to fetch live blog slugs from {config.SPHERON_BLOG_URL}: {e}")
+            return []
+
     @staticmethod
     def _extract_json_array(text: str) -> list[dict]:
         """Extract a JSON array from text, trying each [...] match until one parses."""
@@ -130,6 +150,33 @@ class DiscoveryAgent:
                         break
         return []
 
+    @staticmethod
+    def _extract_suggestion_decisions(text: str) -> list[dict]:
+        """Extract the suggestion_decisions array from Claude's response text, if present."""
+        if not isinstance(text, str):
+            return []
+        # Look for the key directly, then scan backwards for the enclosing object or
+        # forward to the value array.
+        key_match = re.search(r'"suggestion_decisions"\s*:\s*(\[)', text)
+        if not key_match:
+            return []
+        start = key_match.end() - 1  # position of the '['
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start:i + 1])
+                        if isinstance(parsed, list):
+                            return parsed
+                    except (json.JSONDecodeError, ValueError):
+                        return []
+                    break
+        return []
+
     def _parse_claude_result(self, result: dict) -> list[dict]:
         """Parse Claude's discovery result into a list of topic dicts. Used by both
         normal flow and recovery."""
@@ -143,19 +190,105 @@ class DiscoveryAgent:
             return raw
         return []
 
+    def _parse_suggestion_decisions(self, result: dict) -> list[dict]:
+        """Parse suggestion decisions from Claude's discovery result."""
+        raw = result.get("result", "")
+        if isinstance(raw, str):
+            return self._extract_suggestion_decisions(raw)
+        if isinstance(raw, dict):
+            text = raw.get("result", "") or raw.get("text", "") or str(raw)
+            return self._extract_suggestion_decisions(text)
+        return []
+
+    async def _apply_suggestion_decisions(
+        self, decisions: list[dict], suggestions: list[dict], run_id: int
+    ):
+        """Update suggestion rows in the DB based on Claude's decisions."""
+        if not suggestions:
+            return
+        decided_ids = set()
+        by_id = {s["id"]: s for s in suggestions}
+        for d in decisions or []:
+            if not isinstance(d, dict):
+                continue
+            sid = d.get("id")
+            if sid is None or sid not in by_id:
+                continue
+            decided_ids.add(sid)
+            decision = (d.get("decision") or "").lower()
+            reason = d.get("reason") or ""
+            produced = d.get("produced_topic_title") or ""
+            if decision == "skip":
+                status = "skipped"
+            elif decision in ("use", "angle"):
+                status = "used"
+                if decision == "angle" and produced:
+                    reason = f"Angle: {produced}. {reason}".strip()
+            else:
+                # Unknown decision - leave pending but record reason
+                await self.db.update_suggestion(
+                    sid, reason=f"Unparsed decision ({decision}): {reason}", last_run_id=run_id
+                )
+                continue
+            await self.db.update_suggestion(
+                sid, status=status, reason=reason, last_run_id=run_id
+            )
+            await self._emit(
+                "topics",
+                f"Suggestion #{sid} '{by_id[sid]['title']}' -> {status}: {reason[:160]}",
+            )
+        # Suggestions Claude did not return a decision for stay pending but get a note
+        for s in suggestions:
+            if s["id"] not in decided_ids:
+                await self.db.update_suggestion(
+                    s["id"],
+                    reason="No decision returned by discovery run - will retry next run",
+                    last_run_id=run_id,
+                )
+
     async def discover_topics(self, run_id: int = None) -> list[dict]:
         """Use Claude Code to discover new blog topics."""
         existing = await self.get_existing_blog_titles()
         logger.info(f"Found {len(existing)} existing blog topics")
 
+        # Fetch the complete live slug catalog so Claude sees every published post
+        # (WebFetch-in-prompt gets summarized and truncated to ~half the posts).
+        live_slugs = await self.get_live_blog_slugs()
+        logger.info(f"Fetched {len(live_slugs)} live blog slugs from {config.SPHERON_BLOG_URL}")
+
+        # Load pending user suggestions and pass them to Claude
+        pending_suggestions = await self.db.get_pending_suggestions()
+        suggestion_payload = []
+        for s in pending_suggestions:
+            kws = s.get("keywords", "[]")
+            try:
+                kws = json.loads(kws) if isinstance(kws, str) else kws
+            except (json.JSONDecodeError, TypeError):
+                kws = []
+            suggestion_payload.append({
+                "id": s["id"],
+                "title": s["title"],
+                "keywords": kws,
+                "notes": s.get("notes", ""),
+            })
+
         await self._emit("search", f"Searching for {config.DISCOVERY_TOPIC_COUNT} trending topics via Claude Code...")
         await self._emit("search", f"Deduplicating against {len(existing)} existing blog titles")
+        if live_slugs:
+            await self._emit("search", f"Loaded full catalog: {len(live_slugs)} published blog slugs")
+        if suggestion_payload:
+            await self._emit(
+                "search",
+                f"Evaluating {len(suggestion_payload)} user suggestion(s) for cannibalization",
+            )
 
         result = await self.claude.discover_topics(
             existing_topics=existing,
             focus_areas=FOCUS_AREAS,
             topic_count=config.DISCOVERY_TOPIC_COUNT,
             run_id=run_id,
+            user_suggestions=suggestion_payload,
+            existing_slugs=live_slugs,
         )
 
         if not result.get("success"):
@@ -165,6 +298,15 @@ class DiscoveryAgent:
             return []
 
         await self._emit("search", "Claude session finished, parsing results...")
+
+        # Apply user-suggestion decisions first so they are persisted even if the
+        # topics array failed to parse or Claude chose to skip every suggestion
+        # (which legitimately produces zero new topics).
+        if suggestion_payload:
+            decisions = self._parse_suggestion_decisions(result)
+            await self._apply_suggestion_decisions(
+                decisions, suggestion_payload, run_id or 0
+            )
 
         topics = self._parse_claude_result(result)
         if not topics:

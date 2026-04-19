@@ -682,6 +682,60 @@ button { font-family: var(--f-sans); cursor: pointer; }
 }
 .pagination-info { color: var(--t3); }
 
+/* ── Suggestions form ────────────────────────────────────────── */
+.suggestion-form {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1.4fr auto;
+  gap: 10px;
+  padding: 14px;
+  background: var(--s1);
+  border: 1px solid var(--b1);
+  border-radius: var(--r-lg);
+  margin-bottom: 16px;
+}
+.suggestion-form .field-input,
+.suggestion-form .field-textarea {
+  background: var(--s2);
+  border: 1px solid var(--b2);
+  border-radius: var(--r);
+  padding: 8px 10px;
+  font-family: var(--f-sans);
+  font-size: 13px;
+  color: var(--t1);
+  outline: none;
+  transition: border-color 0.12s, background 0.12s;
+}
+.suggestion-form .field-input:focus,
+.suggestion-form .field-textarea:focus {
+  border-color: var(--amber-ring);
+  background: var(--s3);
+}
+.suggestion-form .field-input::placeholder,
+.suggestion-form .field-textarea::placeholder { color: var(--t3); }
+.suggestion-form .field-textarea { resize: vertical; min-height: 36px; }
+
+.suggestion-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.suggestion-status.pending { background: rgba(232, 165, 48, 0.1); color: var(--warning); }
+.suggestion-status.used    { background: rgba(45, 184, 130, 0.1); color: var(--success); }
+.suggestion-status.skipped { background: rgba(101, 118, 152, 0.1); color: var(--t2); }
+
+.suggestion-reason {
+  font-size: 12px;
+  color: var(--t3);
+  margin-top: 4px;
+  line-height: 1.5;
+  max-width: 480px;
+}
+.suggestion-kw { color: var(--t2); font-size: 12px; }
+
 /* ── App footer ──────────────────────────────────────────────── */
 .app-footer {
   margin-top: auto;

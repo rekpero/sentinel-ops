@@ -326,6 +326,19 @@ class TopicCreate(BaseModel):
     spheron_angle: str = ""
 
 
+class SuggestionCreate(BaseModel):
+    title: str
+    keywords: list[str] = []
+    notes: str = ""
+
+
+class SuggestionUpdate(BaseModel):
+    title: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+
 class TriggerResponse(BaseModel):
     message: str
     success: bool
@@ -400,6 +413,61 @@ async def create_topic(topic: TopicCreate):
         spheron_angle=topic.spheron_angle,
     )
     return {"id": topic_id, "status": "discovered"}
+
+
+# --- Discovery Suggestions ---
+
+def _parse_suggestion_row(s: dict) -> dict:
+    if isinstance(s.get("keywords"), str):
+        try:
+            s["keywords"] = json.loads(s["keywords"])
+        except (json.JSONDecodeError, TypeError):
+            s["keywords"] = []
+    return s
+
+
+@app.get("/api/suggestions")
+async def list_suggestions(status: str = ""):
+    """List discovery suggestions (operator-provided ideas for discovery to evaluate)."""
+    rows = await db.list_suggestions(status=status)
+    return [_parse_suggestion_row(r) for r in rows]
+
+
+@app.post("/api/suggestions")
+async def create_suggestion(payload: SuggestionCreate):
+    """Add a new discovery suggestion."""
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    suggestion_id = await db.create_suggestion(
+        title=title,
+        keywords=payload.keywords,
+        notes=payload.notes.strip(),
+    )
+    return {"id": suggestion_id, "status": "pending"}
+
+
+@app.patch("/api/suggestions/{suggestion_id}")
+async def update_suggestion(suggestion_id: int, payload: SuggestionUpdate):
+    """Update a suggestion (e.g. reset status to pending to re-evaluate on next run)."""
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields to update")
+    if "status" in updates and updates["status"] not in ("pending", "used", "skipped"):
+        raise HTTPException(status_code=400, detail="status must be pending|used|skipped")
+    ok = await db.update_suggestion(suggestion_id, **updates)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    return {"success": True}
+
+
+@app.delete("/api/suggestions/{suggestion_id}")
+async def delete_suggestion(suggestion_id: int):
+    """Delete a suggestion."""
+    ok = await db.delete_suggestion(suggestion_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    return {"success": True}
 
 
 # --- Reviews ---

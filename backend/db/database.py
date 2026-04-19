@@ -84,6 +84,18 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (run_id) REFERENCES agent_runs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS discovery_suggestions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    keywords TEXT DEFAULT '[]',
+                    notes TEXT DEFAULT '',
+                    status TEXT DEFAULT 'pending',
+                    reason TEXT DEFAULT '',
+                    last_run_id INTEGER,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
+                );
             """)
             await db.commit()
 
@@ -198,6 +210,70 @@ class Database:
             cursor = await db.execute("SELECT title FROM blog_topics")
             rows = await cursor.fetchall()
             return [r[0] for r in rows]
+
+    # === Discovery Suggestions ===
+
+    async def create_suggestion(self, title: str, keywords: list = None, notes: str = "") -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """INSERT INTO discovery_suggestions (title, keywords, notes)
+                   VALUES (?, ?, ?)""",
+                (title, json.dumps(keywords or []), notes),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def list_suggestions(self, status: str = "") -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if status:
+                cursor = await db.execute(
+                    "SELECT * FROM discovery_suggestions WHERE status = ? ORDER BY created_at DESC",
+                    (status,),
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT * FROM discovery_suggestions ORDER BY created_at DESC"
+                )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_pending_suggestions(self) -> list[dict]:
+        return await self.list_suggestions(status="pending")
+
+    async def update_suggestion(self, suggestion_id: int, **kwargs) -> bool:
+        """Update a suggestion's fields (title, keywords, notes, status, reason, last_run_id)."""
+        if not kwargs:
+            return False
+        allowed = {"title", "keywords", "notes", "status", "reason", "last_run_id"}
+        sets = []
+        values = []
+        for key, val in kwargs.items():
+            if key not in allowed:
+                continue
+            if key == "keywords" and isinstance(val, list):
+                val = json.dumps(val)
+            sets.append(f"{key} = ?")
+            values.append(val)
+        if not sets:
+            return False
+        sets.append("updated_at = datetime('now')")
+        values.append(suggestion_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"UPDATE discovery_suggestions SET {', '.join(sets)} WHERE id = ?",
+                values,
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def delete_suggestion(self, suggestion_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM discovery_suggestions WHERE id = ?", (suggestion_id,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     # === Review Logs ===
 
